@@ -38,6 +38,9 @@ ANSWER_BUDGET = int(os.environ.get("ANSWER_BUDGET", "1024"))
 TRACE_LOG = os.environ.get("TRACE_LOG", "traces.jsonl")
 TRACE_CACHE_GLOB = os.environ.get("TRACE_CACHE_GLOB", "")
 USE_PRIORITY = os.environ.get("USE_PRIORITY", "0") == "1"
+LOG_QUEUE_MAX = int(os.environ.get("LOG_QUEUE_MAX", "20000"))
+LOG_BATCH = int(os.environ.get("LOG_BATCH", "64"))
+LOG_FLUSH_SECS = float(os.environ.get("LOG_FLUSH_SECS", "2.0"))
 COMPRESS_PROMPT_VERSION = "v1"
 
 JSON_HDR = {"content-type": "application/json"}
@@ -45,7 +48,11 @@ LIMITS = httpx.Limits(max_connections=512, max_keepalive_connections=512)
 
 up = httpx.AsyncClient(base_url=VLLM, timeout=3600.0, limits=LIMITS)
 cup = httpx.AsyncClient(base_url=COMPRESSOR_URL, timeout=3600.0, limits=LIMITS)
-LOCK = asyncio.Lock()
+# One producer per request, exactly ONE consumer (log_writer). A single
+# consumer is what makes this safe without any lock: nothing else touches the
+# file handle. See write_record() for why an asyncio.Lock was not enough.
+LOG_Q: asyncio.Queue = asyncio.Queue(maxsize=LOG_QUEUE_MAX)
+_LOG_STOP = object()
 S: dict = {}
 
 # NOTE: an earlier version of this prompt said "preserve the original voice and
@@ -178,9 +185,13 @@ async def lifespan(app: FastAPI):
     print(f"[sidecar] main prompt tail={tail!r} case_b={S['case_b']}", flush=True)
     print(f"[sidecar] compressor tail={ctail!r} nothink={S['nothink']}", flush=True)
     print(f"[sidecar] arm={ARM} ratio={RATIO} cache={len(S['cache'])}", flush=True)
+    writer = asyncio.create_task(log_writer())
     try:
         yield
     finally:
+        # Drain before closing or the tail of the run is lost.
+        await LOG_Q.put(_LOG_STOP)
+        await writer
         S["log"].close()
         await up.aclose()
         await cup.aclose()
@@ -249,8 +260,30 @@ async def compress(raw: str, ids: list[int], arm: str, target: int,
 
 # --------------------------- shared pipeline ----------------------------
 
+_SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "seed",
+                  "presence_penalty", "frequency_penalty", "repetition_penalty")
+
+
+def sampling_common(body: dict) -> dict:
+    """Forward only the sampling params the caller actually set.
+
+    Injecting our own defaults (e.g. temperature=0.6) would silently override
+    the model's generation_config, so a pass-through request would not match
+    what vLLM returns for the same body. Omitted keys let vLLM resolve its own
+    defaults.
+    """
+    return {k: body[k] for k in _SAMPLING_KEYS if body.get(k) is not None}
+
+
+async def prompt_opens_think(p_ids: list[int]) -> bool:
+    """True if the prompt ends inside an unclosed <think> block."""
+    tail = await detok(p_ids[-64:])
+    return tail.rfind("<think>") > tail.rfind("</think>")
+
+
 async def cot_pipeline(p_ids, *, common, arm, ratio, inject, client_stop,
-                       answer_budget, cached=None):
+                       answer_budget, cached=None, expect_think=True,
+                       include_stop=False):
     """think -> compress -> resume, shared by both endpoints.
 
     ``client_stop`` is applied to phase 1 as well as phase 2. On a raw
@@ -261,6 +294,30 @@ async def cot_pipeline(p_ids, *, common, arm, ratio, inject, client_stop,
     """
     te, tp = S["think_end"], S["think_prefix"]
     t0 = time.perf_counter()
+
+    if not expect_think:
+        # The prompt never opens a think block, so there is nothing to compress.
+        # Run exactly one generation with the caller's own parameters so the
+        # response matches what vLLM would have returned for this request.
+        sp = dict(common)
+        if answer_budget:
+            sp["max_tokens"] = answer_budget
+        if client_stop:
+            sp["stop"] = list(client_stop)
+        c = (await post("/inference/v1/generate",
+                        {"token_ids": p_ids, "sampling_params": sp}))["choices"][0]
+        ids = c["token_ids"]
+        # Match vLLM byte for byte: strip_specials() stands in for
+        # skip_special_tokens=True, trim_at_stop() for the stop-string removal.
+        # No .strip() -- vLLM preserves leading and trailing whitespace.
+        text = trim_at_stop(strip_specials(await detok(ids)),
+                            client_stop, include_stop)
+        ms = round((time.perf_counter() - t0) * 1000)
+        return {"no_think": True, "closed": False, "fr1": c["finish_reason"],
+                "reasoning_ids": [], "raw": "", "short": "", "c_ids": [],
+                "cmeta": {}, "cerr": "no_think_block", "answer": text,
+                "answer_ids": ids, "fr2": c["finish_reason"], "p2_text": "",
+                "n_prompt": len(p_ids), "target": 0, "ms": (0, 0, ms)}
 
     if cached is not None:
         reasoning_ids, closed = cached
@@ -331,7 +388,8 @@ async def cot_pipeline(p_ids, *, common, arm, ratio, inject, client_stop,
     if USE_PRIORITY:
         p2["priority"] = -1
     c2 = (await post("/inference/v1/generate", p2))["choices"][0]
-    answer = strip_specials(await detok(c2["token_ids"])).strip()
+    answer = trim_at_stop(strip_specials(await detok(c2["token_ids"])),
+                          client_stop, include_stop).strip()
     t3 = time.perf_counter()
 
     return {"no_think": False, "closed": closed, "fr1": fr1,
@@ -367,18 +425,80 @@ def build_record(res, *, arm, ratio, pkey, extra):
                    "prompt_tail": res["p2_text"][-1500:],
                    "n_prompt_tokens": res["n_prompt"],
                    "original_trace_in_prompt":
-                       res["raw"].strip() in res["p2_text"],
+                       None if res["no_think"]
+                       else res["raw"].strip() in res["p2_text"],
                    "compressed_trace_in_prompt":
-                       res["short"].strip() in res["p2_text"]},
+                       None if res["no_think"]
+                       else res["short"].strip() in res["p2_text"]},
     }
     rec.update(extra)
     return rec
 
 
+def trim_at_stop(text: str, stops, include: bool) -> str:
+    """Replicate vLLM's stop-string handling.
+
+    /v1/completions removes the matched stop string from the returned text when
+    include_stop_str_in_output is false (the default), but /inference/v1/generate
+    returns token ids that still contain it. Without this the pass-through path
+    returns '63\\n\\n' where vLLM returns '63'.
+    """
+    if include or not stops:
+        return text
+    cut = len(text)
+    for st in stops:
+        i = text.find(st)
+        if i != -1:
+            cut = min(cut, i)
+    return text[:cut]
+
+
+def _write_batch(fh, recs):
+    """Runs in a worker thread. json.dumps plus the write syscall both happen
+    off the event loop; on a network filesystem like lustre a write() can stall
+    for milliseconds, which would otherwise freeze every in-flight request."""
+    fh.write("".join(json.dumps(r) + "\n" for r in recs))
+    fh.flush()
+
+
 async def write_record(rec):
-    async with LOCK:
-        S["log"].write(json.dumps(rec) + "\n")
-        S["log"].flush()
+    """Hand the record to the writer task.
+
+    Uses ``await put`` rather than ``put_nowait`` so a full queue applies
+    backpressure instead of dropping records -- this is an experiment log and a
+    silently missing row is worse than a slow one. The queue is sized so that
+    only a pathological stall could fill it.
+    """
+    await LOG_Q.put(rec)
+
+
+async def log_writer():
+    """Single consumer. Batches whatever has accumulated, writes it in a thread.
+
+    Because there is exactly one of these, no lock is needed anywhere: the file
+    handle has a single owner. Flushes at most every LOG_FLUSH_SECS so a crash
+    loses at most that much, rather than flushing on every record.
+    """
+    fh = S["log"]
+    stopping = False
+    while not stopping:
+        try:
+            rec = await asyncio.wait_for(LOG_Q.get(), timeout=LOG_FLUSH_SECS)
+        except asyncio.TimeoutError:
+            continue
+        batch = []
+        if rec is _LOG_STOP:
+            stopping = True
+        else:
+            batch.append(rec)
+        while len(batch) < LOG_BATCH and not LOG_Q.empty():
+            nxt = LOG_Q.get_nowait()
+            if nxt is _LOG_STOP:
+                stopping = True
+                break
+            batch.append(nxt)
+        if batch:
+            await asyncio.to_thread(_write_batch, fh, batch)
 
 
 def cot_meta(res, arm):
@@ -393,8 +513,10 @@ def cot_meta(res, arm):
                                 / max(len(res["reasoning_ids"]), 1), 4),
         "phase1_closed": res["closed"],
         "no_think_block": res["no_think"],
-        "original_trace_in_prompt": res["raw"].strip() in res["p2_text"],
-        "compressed_trace_in_prompt": res["short"].strip() in res["p2_text"],
+        "original_trace_in_prompt":
+            None if res["no_think"] else res["raw"].strip() in res["p2_text"],
+        "compressed_trace_in_prompt":
+            None if res["no_think"] else res["short"].strip() in res["p2_text"],
         "compressor_truncated": res["cmeta"].get("truncated"),
         "error": res["cerr"],
         "ms": {"phase1": m1, "compress": mc, "phase2": m2},
@@ -413,9 +535,8 @@ async def chat(req: Request):
     ratio = float(body.pop("cot_ratio", RATIO))
     inject = body.pop("cot_inject", None)
 
-    temp = body.get("temperature", 0.6)
     seed = body.get("seed")
-    common = {"temperature": temp, "top_p": body.get("top_p", 1.0), "seed": seed}
+    common = sampling_common(body)
     pkey = prompt_key(body["messages"])
 
     rendered = await post("/v1/chat/completions/render",
@@ -425,14 +546,15 @@ async def chat(req: Request):
     res = await cot_pipeline(p_ids, common=common, arm=arm, ratio=ratio,
                              inject=inject, client_stop=body.get("stop"),
                              answer_budget=ANSWER_BUDGET,
+                             include_stop=bool(body.get(
+                                 "include_stop_str_in_output", False)),
                              cached=S["cache"].get((pkey, seed)))
 
     rid = f"chatcmpl-{uuid.uuid4().hex}"
     await write_record(build_record(res, arm=arm, ratio=ratio, pkey=pkey, extra={
         "id": rid, "endpoint": "chat", "messages": body["messages"],
         "client_request_id": req.headers.get("x-request-id"),
-        "sampling": {"temperature": temp, "top_p": body.get("top_p", 1.0),
-                     "seed": seed, "think_budget": THINK_BUDGET,
+        "sampling": {**common, "think_budget": THINK_BUDGET,
                      "answer_budget": ANSWER_BUDGET},
         "n_prompt_tokens": len(p_ids)}))
 
@@ -494,28 +616,29 @@ async def completions(req: Request):
                                              "add_special_tokens": add_special}))["tokens"]
         return list(p)
 
-    temp = body.get("temperature", 0.6)
     seed = body.get("seed")
-    common = {"temperature": temp, "top_p": body.get("top_p", 1.0), "seed": seed}
+    common = sampling_common(body)
     stop = body.get("stop") or None
     if isinstance(stop, str):
         stop = [stop]
     budget = int(body.get("max_tokens") or ANSWER_BUDGET)
+    include_stop = bool(body.get("include_stop_str_in_output", False))
 
     async def one(idx, p):
         p_ids = await tokenize_prompt(p)
         pkey = prompt_key(p if isinstance(p, str) else p_ids)
+        expect = await prompt_opens_think(p_ids) or S["case_b"]
         res = await cot_pipeline(p_ids, common=common, arm=arm, ratio=ratio,
                                  inject=inject, client_stop=stop,
-                                 answer_budget=budget,
+                                 answer_budget=budget, expect_think=expect,
+                                 include_stop=include_stop,
                                  cached=S["cache"].get((pkey, seed)))
         await write_record(build_record(res, arm=arm, ratio=ratio, pkey=pkey,
                                         extra={
             "id": f"cmpl-{uuid.uuid4().hex}", "endpoint": "completions",
             "prompt": p if isinstance(p, str) else None,
             "client_request_id": req.headers.get("x-request-id"),
-            "sampling": {"temperature": temp, "top_p": body.get("top_p", 1.0),
-                         "seed": seed, "think_budget": THINK_BUDGET,
+            "sampling": {**common, "think_budget": THINK_BUDGET,
                          "answer_budget": budget},
             "n_prompt_tokens": len(p_ids)}))
         return idx, res

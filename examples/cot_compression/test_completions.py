@@ -87,6 +87,8 @@ def main():
     print(f"  text: {r['choices'][0]['text'][:160]!r}")
     if not cc["no_think_block"]:
         fails.append("2: bare prompt should have been flagged no_think_block")
+    if cc["original_trace_in_prompt"] is not None:
+        fails.append("2: provenance flags should be null when nothing was spliced")
     if cc["error"] != "no_think_block":
         fails.append(f"2: expected error='no_think_block', got {cc['error']!r}")
 
@@ -126,6 +128,49 @@ def main():
         except urllib.error.HTTPError as e:
             print(f"  {extra}: rejected {e.code} - "
                   f"{json.loads(e.read())['error']['message'][:70]}")
+
+    print("\n" + "=" * 74)
+    print("5. pass-through fidelity: sidecar output == vLLM output")
+    print("=" * 74)
+    vllm_url = a.sidecar.rsplit(":", 1)[0] + ":8000/v1/completions"
+
+    # (a) identical generation for a bare prompt
+    req = {"model": a.model, "prompt": FEWSHOT, "temperature": 0.0,
+           "max_tokens": 32, "seed": 99, "stop": ["\n\n", "Question:"]}
+    direct = post(vllm_url, dict(req))["choices"][0]
+    viaside = post(url, dict(req))["choices"][0]
+    same = direct["text"] == viaside["text"]
+    print(f"  vLLM direct : {direct['text']!r} ({direct['finish_reason']})")
+    print(f"  via sidecar : {viaside['text']!r} ({viaside['finish_reason']})")
+    print(f"  identical   : {same}")
+    if not same:
+        fails.append("5a: pass-through text differs from vLLM direct")
+    if direct["finish_reason"] != viaside["finish_reason"]:
+        fails.append("5b: pass-through finish_reason differs from vLLM direct")
+
+    # (b) caller max_tokens is honoured, not replaced by THINK_BUDGET
+    req = {"model": a.model, "prompt": "Write a long essay about clouds.",
+           "temperature": 0.0, "max_tokens": 8, "seed": 99}
+    direct = post(vllm_url, dict(req))["choices"][0]
+    viaside = post(url, dict(req))["choices"][0]
+    print(f"\n  max_tokens=8  vLLM direct : {direct['text']!r} "
+          f"({direct['finish_reason']})")
+    print(f"  max_tokens=8  via sidecar : {viaside['text']!r} "
+          f"({viaside['finish_reason']})")
+    if viaside["finish_reason"] != "length":
+        fails.append(f"5c: max_tokens=8 gave finish_reason="
+                     f"{viaside['finish_reason']!r}, expected 'length'")
+    if direct["text"] != viaside["text"]:
+        fails.append("5d: max_tokens-capped text differs from vLLM direct")
+
+    # (c) omitted sampling params must not be overridden by sidecar defaults
+    req = {"model": a.model, "prompt": FEWSHOT, "max_tokens": 16, "seed": 5,
+           "stop": ["\n\n"]}
+    direct = post(vllm_url, dict(req))["choices"][0]["text"]
+    viaside = post(url, dict(req))["choices"][0]["text"]
+    print(f"\n  no temp/top_p  vLLM direct : {direct!r}")
+    print(f"  no temp/top_p  via sidecar : {viaside!r}")
+    print("  (both should use the model's generation_config defaults)")
 
     print("\n" + "=" * 74)
     for f in fails:

@@ -189,6 +189,33 @@ arms cannot degrade, because the model is not leaning on the trace in the first
 place.** Any real measurement needs problems hard enough that re-deriving from
 scratch is expensive.
 
+## Trace logging is off the event loop
+
+Records go to a bounded `asyncio.Queue`; a single background task batches them
+and does `json.dumps` plus the write syscall inside `asyncio.to_thread`, so the
+event loop never waits on the filesystem. On lustre a `write()` can stall for
+milliseconds, which would otherwise freeze every in-flight request in the
+process.
+
+- **No lock anywhere.** There is exactly one consumer, so the file handle has a
+  single owner. The sidecar is single-threaded asyncio, so `threading.Lock` was
+  never relevant, and the single-consumer design removes the need for the
+  `asyncio.Lock` too.
+- **Backpressure, not dropping.** `write_record` uses `await queue.put()`. A
+  full queue slows the producing request rather than silently losing a row --
+  this is an experiment log.
+- **Drained on shutdown.** The lifespan pushes a sentinel and awaits the writer
+  before closing the file, so the tail of a run is not lost.
+- **Batched flush** every `LOG_BATCH` records or `LOG_FLUSH_SECS`, instead of a
+  flush per record.
+
+Tuning: `LOG_QUEUE_MAX` (20000), `LOG_BATCH` (64), `LOG_FLUSH_SECS` (2.0).
+
+**Multiple processes is the one case no lock solves.** With `uvicorn --workers N`
+those are separate processes; interleaved appends of multi-KB records will
+corrupt lines regardless of any in-process lock. Keep one worker, or put the PID
+in `TRACE_LOG`.
+
 ## Notes
 
 This is research tooling, not a vLLM contribution. It should not be proposed as a
