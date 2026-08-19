@@ -10,8 +10,27 @@ One inbound `/v1/chat/completions` request is split into three steps:
    server, with the compressor's own thinking disabled)
 3. **phase 2** — resume generation with the compressed trace spliced back in
 
-Everything else is proxied to vLLM unchanged, so an eval harness can point at the
-sidecar without modification.
+Both `/v1/chat/completions` and `/v1/completions` are intercepted; everything
+else is proxied to vLLM unchanged, so an eval harness can point at the sidecar
+without modification.
+
+### /v1/completions
+
+Same pipeline over a raw prompt. Accepts a string, a token-ID list, or a batch of
+either. Two things differ from the chat endpoint:
+
+- **A bare prompt may have no `<think>` scaffolding**, in which case there is no
+  reasoning block to compress. The sidecar detects this, returns the generation
+  untouched, and sets `no_think_block: true` with `error: "no_think_block"` — so
+  a completions eval can never silently report an uncompressed run as a
+  compressed one. Pre-render with the chat template (prompt ending in `<think>`)
+  if you want compression on this endpoint.
+- **Unsupported options are rejected with a 400**, not ignored: `echo`, `suffix`,
+  `logprobs`, `best_of`, `prompt_logprobs`, `n > 1`, `stream`.
+
+The caller's `stop` strings are applied to phase 1 *and* phase 2, since on a
+no-think prompt phase 1 is the whole answer. `max_tokens` sets the phase-2 budget
+here (unlike the chat endpoint, which uses `ANSWER_BUDGET`).
 
 No vLLM source changes are required. The sidecar drives vLLM's existing
 token-in / token-out API:

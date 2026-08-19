@@ -7,13 +7,18 @@ Three independent checks:
   A. Provenance   the phase-2 prompt contains the compressed trace and does NOT
                   contain the original one (read back from the sidecar, which
                   detokenizes the prompt it actually sent).
-  B. Route        ASSERTED. Inject two traces that both reach the CORRECT answer
-                  (187) by different routes -- multiply by 0.85, or subtract the
-                  33 failures. Both are right, so the model has no reason to
-                  override either; if the answer's derivation tracks whichever
-                  route was injected, it was generated from the injected text.
-                  Run n times because vLLM is not bit-reproducible across batch
-                  compositions.
+  B. Route        ASSERTED. On a HARD problem (501-token trace), inject two
+                  traces that both reach the CORRECT answer by different routes
+                  -- block summation, or arithmetic progressions. Both are
+                  right, so the model has no reason to override either; if the
+                  derivation tracks whichever route was injected, the answer was
+                  generated from the injected text. Run n times because vLLM is
+                  not bit-reproducible across batch compositions.
+                  NOTE: this test only discriminates on hard problems. On the
+                  easy factory problem the model re-solves from the question and
+                  ignores the injected route entirely (measured 0/3 both ways),
+                  which is itself a finding: on easy problems the trace is not
+                  load-bearing and compression cannot degrade anything.
   C. Divergent    REPORTED, NOT ASSERTED. Inject a trace reaching a different
                   answer (107) via a fact absent from the question. Whether the
                   model follows or overrides is stochastic -- observed both ways
@@ -32,17 +37,24 @@ Q = ("A factory produces 20 robots per hour for 6 hours, then 25 robots per "
      "How many robots pass inspection? End your response with "
      "'ANSWER: <integer>'.")
 
-ROUTE_MUL = (
-    "Total produced = 20*6 + 25*4 = 220.\n"
-    "Pass rate is 85%, so multiply: 220 * 0.85 = 187.\n"
-    "ANSWER: 187"
+HARD_Q = ("Let S be the set of all positive integers n with n <= 1000 such that "
+          "n^2 + 1 is divisible by 5. What is the sum of all elements of S? "
+          "End your response with 'ANSWER: <integer>'.")
+
+ROUTE_BLOCK = (
+    "n^2+1 = 0 mod 5 => n^2 = 4 mod 5 => n = 2,3 mod 5.\n"
+    "Index k=0..199 over blocks 5k+1..5k+5. Valid: 5k+2 and 5k+3.\n"
+    "Sum per block: (5k+2)+(5k+3) = 10k+5.\n"
+    "Total = sum_{k=0}^{199} (10k+5) = 10*19900 + 1000 = 200000.\n"
+    "ANSWER: 200000"
 )
 
-ROUTE_SUB = (
-    "Total produced = 20*6 + 25*4 = 220.\n"
-    "Failures are 15% of 220 = 33.\n"
-    "Subtract the failures: 220 - 33 = 187.\n"
-    "ANSWER: 187"
+ROUTE_AP = (
+    "n^2+1 = 0 mod 5 => n^2 = 4 mod 5 => n = 2,3 mod 5.\n"
+    "Residue 2: the AP 2,7,...,997 has 200 terms.\n"
+    "Residue 3: the AP 3,8,...,998 has 200 terms.\n"
+    "Sums: 200/2*(2+997)=99900 and 200/2*(3+998)=100100. Total 200000.\n"
+    "ANSWER: 200000"
 )
 
 DIVERGENT = (
@@ -62,9 +74,10 @@ def post(url, payload, timeout=1800):
         return json.loads(r.read())
 
 
-def ask(sidecar, model, **extra):
+def ask(sidecar, model, question=Q, **extra):
     return post(f"{sidecar}/v1/chat/completions",
-                {"model": model, "messages": [{"role": "user", "content": Q}],
+                {"model": model,
+                 "messages": [{"role": "user", "content": question}],
                  "temperature": 0.6, "top_p": 0.95, "seed": 1234, **extra})
 
 
@@ -94,25 +107,25 @@ def main():
             fails.append("A/identity: identity arm should preserve the original")
 
     print("\n" + "=" * 74)
-    print("CHECK B - route dependence (both injected traces are CORRECT)")
+    print("CHECK B - route dependence on a HARD problem (both routes CORRECT)")
     print("=" * 74)
-    N = 3
-    for label, trace, marker in (("multiply", ROUTE_MUL, "33"),
-                                 ("subtract", ROUTE_SUB, "33")):
-        hits = 0
+    N = 4
+    for label, trace in (("block", ROUTE_BLOCK), (" ap  ", ROUTE_AP)):
+        nb = na = 0
         for _ in range(N):
-            r = ask(a.sidecar, a.model, cot_arm="inject", cot_inject=trace)
-            ans = r["choices"][0]["message"]["content"]
-            if marker in ans:
-                hits += 1
-        print(f"\n[{label} route] '33' (the subtraction step) appears in "
-              f"{hits}/{N} answers")
-        if label == "subtract" and hits == 0:
-            fails.append("B: subtract-route trace did not produce the "
-                         "subtraction step in any answer")
-        if label == "multiply" and hits == N:
-            fails.append("B: multiply-route trace still produced the "
-                         "subtraction step every time")
+            r = ask(a.sidecar, a.model, question=HARD_Q,
+                    cot_arm="inject", cot_inject=trace)
+            t = r["choices"][0]["message"]["content"].replace(" ", "")
+            if "10k" in t or "5k+2" in t:
+                nb += 1
+            if "997" in t:
+                na += 1
+        print(f"  injected {label} route -> answer used block {nb}/{N}, "
+              f"AP {na}/{N}")
+        if label == "block" and nb < N:
+            fails.append(f"B: block route only tracked {nb}/{N}")
+        if label.strip() == "ap" and na < N:
+            fails.append(f"B: AP route only tracked {na}/{N}")
 
     print("\n" + "=" * 74)
     print("CHECK C - divergent trace, reported as a rate")

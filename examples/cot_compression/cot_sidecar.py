@@ -247,45 +247,34 @@ async def compress(raw: str, ids: list[int], arm: str, target: int,
     raise ValueError(f"unknown arm {arm!r}")
 
 
-# ------------------------------ main route ------------------------------
+# --------------------------- shared pipeline ----------------------------
 
-@app.post("/v1/chat/completions")
-async def chat(req: Request):
-    body = await req.json()
-    if body.get("stream"):
-        return JSONResponse({"error": {"message": "sidecar is non-streaming"}}, 400)
+async def cot_pipeline(p_ids, *, common, arm, ratio, inject, client_stop,
+                       answer_budget, cached=None):
+    """think -> compress -> resume, shared by both endpoints.
 
-    # Per-request overrides so one server can serve every arm.
-    arm = body.pop("cot_arm", ARM)
-    ratio = float(body.pop("cot_ratio", RATIO))
-    inject = body.pop("cot_inject", None)
-
-    te = S["think_end"]
-    tp = S["think_prefix"]
-    temp = body.get("temperature", 0.6)
-    seed = body.get("seed")
-    common = {"temperature": temp, "top_p": body.get("top_p", 1.0), "seed": seed}
-    pkey = prompt_key(body["messages"])
-
+    ``client_stop`` is applied to phase 1 as well as phase 2. On a raw
+    /v1/completions prompt there may be no ``<think>`` scaffolding at all, in
+    which case phase 1 *is* the whole answer and must honour the caller's stop
+    strings. ``no_think`` in the result says that happened, so callers never
+    silently report an uncompressed generation as a compressed one.
+    """
+    te, tp = S["think_end"], S["think_prefix"]
     t0 = time.perf_counter()
 
-    # (1) messages -> prompt token ids
-    rendered = await post("/v1/chat/completions/render",
-                          {**body, "stream": False, "max_tokens": 1})
-    p_ids = rendered["token_ids"]
-
-    # (2) phase 1: think until </think>
-    cached = S["cache"].get((pkey, seed))
     if cached is not None:
         reasoning_ids, closed = cached
-        fr1 = "cached"
+        fr1, gen = "cached", None
     else:
         sp = {**common, "max_tokens": THINK_BUDGET}
+        stops = list(client_stop or [])
         if S["te_single"]:
             sp["stop_token_ids"] = [te]
         else:
-            sp["stop"] = ["</think>"]
+            stops.append("</think>")
             sp["include_stop_str_in_output"] = True
+        if stops:
+            sp["stop"] = stops
         c1 = (await post("/inference/v1/generate",
                          {"token_ids": p_ids, "sampling_params": sp}))["choices"][0]
         gen = c1["token_ids"]
@@ -298,106 +287,253 @@ async def chat(req: Request):
         else:
             gen_text = await detok(gen)
             closed = gen_text.rstrip().endswith("</think>")
-            reasoning_ids = (await tok(gen_text.rstrip()[:-len("</think>")])
+            reasoning_ids = (await tok(gen_text.rstrip()[: -len("</think>")])
                              if closed else gen)
     t1 = time.perf_counter()
 
     raw = await detok(reasoning_ids)
 
-    # (3) compress; never fail the request, but record the failure
+    # No </think> and phase 1 ended on its own terms: there was no reasoning
+    # block to compress and this generation is already the complete answer.
+    # Hand it back untouched rather than force-closing a block that never opened.
+    no_think = (not closed) and fr1 in ("stop", "cached")
+    if no_think:
+        return {"no_think": True, "closed": False, "fr1": fr1,
+                "reasoning_ids": reasoning_ids, "raw": raw, "short": raw,
+                "c_ids": reasoning_ids, "cmeta": {}, "cerr": "no_think_block",
+                "answer": strip_specials(raw).strip(),
+                "answer_ids": reasoning_ids, "fr2": fr1, "p2_text": "",
+                "n_prompt": len(p_ids), "target": 0,
+                "ms": (round((t1 - t0) * 1000), 0, 0)}
+
     target = max(16, int(len(reasoning_ids) * ratio))
-    cerr = None
-    cmeta: dict = {}
+    cerr, cmeta = None, {}
     if closed:
         try:
-            short = await compress(raw, reasoning_ids, arm, target, cmeta,
-                                   inject)
+            short = await compress(raw, reasoning_ids, arm, target, cmeta, inject)
         except Exception as e:  # noqa: BLE001
             short, cerr = raw, f"{type(e).__name__}: {e}"
     else:
         short, cerr = raw, "phase1_not_closed"
     short = short.rstrip()
 
-    c_ids = await tok(short)                       # measured compressed length
-    splice = await tok(short + "\n</think>\n\n")   # exact phase-2 continuation
-    # Pure detokenize->tokenize round trip of the ORIGINAL trace. This is the
-    # token-boundary artifact the identity arm exists to detect; it must not be
-    # conflated with the rstrip applied above for splicing.
+    c_ids = await tok(short)
+    splice = await tok(short + "\n</think>\n\n")
     roundtrip_ids = await tok(raw)
     t2 = time.perf_counter()
 
-    # (4) phase 2: resume after the closed think block
     p2_ids = p_ids + tp + splice
     p2_text = await detok(p2_ids)
     p2 = {"token_ids": p2_ids,
-          "sampling_params": {**common, "max_tokens": ANSWER_BUDGET}}
+          "sampling_params": {**common, "max_tokens": answer_budget}}
+    if client_stop:
+        p2["sampling_params"]["stop"] = list(client_stop)
     if USE_PRIORITY:
         p2["priority"] = -1
     c2 = (await post("/inference/v1/generate", p2))["choices"][0]
     answer = strip_specials(await detok(c2["token_ids"])).strip()
     t3 = time.perf_counter()
 
+    return {"no_think": False, "closed": closed, "fr1": fr1,
+            "reasoning_ids": reasoning_ids, "raw": raw, "short": short,
+            "c_ids": c_ids, "roundtrip_ids": roundtrip_ids, "cmeta": cmeta,
+            "cerr": cerr, "answer": answer, "answer_ids": c2["token_ids"],
+            "fr2": c2["finish_reason"], "p2_text": p2_text,
+            "n_prompt": len(p2_ids), "target": target,
+            "ms": (round((t1 - t0) * 1000), round((t2 - t1) * 1000),
+                   round((t3 - t2) * 1000))}
+
+
+def build_record(res, *, arm, ratio, pkey, extra):
+    m1, mc, m2 = res["ms"]
+    rec = {
+        "schema": 2, "ts": time.time(), "arm": arm, "ratio_requested": ratio,
+        "compress_prompt_version": COMPRESS_PROMPT_VERSION, "prompt_key": pkey,
+        "phase1": {"text": res["raw"], "token_ids": res["reasoning_ids"],
+                   "n_tokens": len(res["reasoning_ids"]),
+                   "finish_reason": res["fr1"], "closed": res["closed"],
+                   "no_think_block": res["no_think"], "ms": m1},
+        "compress": {"text": res["short"], "token_ids": res["c_ids"],
+                     "n_tokens": len(res["c_ids"]),
+                     "achieved_ratio": len(res["c_ids"])
+                     / max(len(res["reasoning_ids"]), 1),
+                     "retok_identical": res.get("roundtrip_ids")
+                     == res["reasoning_ids"],
+                     "roundtrip_n_tokens": len(res.get("roundtrip_ids") or []),
+                     "error": res["cerr"], "ms": mc,
+                     "target_tokens": res["target"], **res["cmeta"]},
+        "phase2": {"text": res["answer"], "n_tokens": len(res["answer_ids"]),
+                   "finish_reason": res["fr2"], "ms": m2,
+                   "prompt_tail": res["p2_text"][-1500:],
+                   "n_prompt_tokens": res["n_prompt"],
+                   "original_trace_in_prompt":
+                       res["raw"].strip() in res["p2_text"],
+                   "compressed_trace_in_prompt":
+                       res["short"].strip() in res["p2_text"]},
+    }
+    rec.update(extra)
+    return rec
+
+
+async def write_record(rec):
+    async with LOCK:
+        S["log"].write(json.dumps(rec) + "\n")
+        S["log"].flush()
+
+
+def cot_meta(res, arm):
+    m1, mc, m2 = res["ms"]
+    return {
+        "arm": arm,
+        "original_reasoning": res["raw"],
+        "compressed_reasoning": res["short"],
+        "reasoning_tokens": len(res["reasoning_ids"]),
+        "compressed_tokens": len(res["c_ids"]),
+        "achieved_ratio": round(len(res["c_ids"])
+                                / max(len(res["reasoning_ids"]), 1), 4),
+        "phase1_closed": res["closed"],
+        "no_think_block": res["no_think"],
+        "original_trace_in_prompt": res["raw"].strip() in res["p2_text"],
+        "compressed_trace_in_prompt": res["short"].strip() in res["p2_text"],
+        "compressor_truncated": res["cmeta"].get("truncated"),
+        "error": res["cerr"],
+        "ms": {"phase1": m1, "compress": mc, "phase2": m2},
+    }
+
+
+# ------------------------------ chat route ------------------------------
+
+@app.post("/v1/chat/completions")
+async def chat(req: Request):
+    body = await req.json()
+    if body.get("stream"):
+        return JSONResponse({"error": {"message": "sidecar is non-streaming"}}, 400)
+
+    arm = body.pop("cot_arm", ARM)
+    ratio = float(body.pop("cot_ratio", RATIO))
+    inject = body.pop("cot_inject", None)
+
+    temp = body.get("temperature", 0.6)
+    seed = body.get("seed")
+    common = {"temperature": temp, "top_p": body.get("top_p", 1.0), "seed": seed}
+    pkey = prompt_key(body["messages"])
+
+    rendered = await post("/v1/chat/completions/render",
+                          {**body, "stream": False, "max_tokens": 1})
+    p_ids = rendered["token_ids"]
+
+    res = await cot_pipeline(p_ids, common=common, arm=arm, ratio=ratio,
+                             inject=inject, client_stop=body.get("stop"),
+                             answer_budget=ANSWER_BUDGET,
+                             cached=S["cache"].get((pkey, seed)))
+
     rid = f"chatcmpl-{uuid.uuid4().hex}"
-    record = {
-        "schema": 1, "id": rid, "ts": time.time(),
-        "arm": arm, "ratio_requested": ratio,
-        "compress_prompt_version": COMPRESS_PROMPT_VERSION,
-        "prompt_key": pkey,
+    await write_record(build_record(res, arm=arm, ratio=ratio, pkey=pkey, extra={
+        "id": rid, "endpoint": "chat", "messages": body["messages"],
         "client_request_id": req.headers.get("x-request-id"),
-        "messages": body["messages"],
         "sampling": {"temperature": temp, "top_p": body.get("top_p", 1.0),
                      "seed": seed, "think_budget": THINK_BUDGET,
                      "answer_budget": ANSWER_BUDGET},
-        "n_prompt_tokens": len(p_ids),
-        "phase1": {"text": raw, "token_ids": reasoning_ids,
-                   "n_tokens": len(reasoning_ids), "finish_reason": fr1,
-                   "closed": closed, "cache_hit": cached is not None,
-                   "ms": round((t1 - t0) * 1000)},
-        "compress": {"text": short, "token_ids": c_ids, "n_tokens": len(c_ids),
-                     "achieved_ratio": len(c_ids) / max(len(reasoning_ids), 1),
-                     "retok_identical": roundtrip_ids == reasoning_ids,
-                     "roundtrip_n_tokens": len(roundtrip_ids),
-                     "error": cerr, "ms": round((t2 - t1) * 1000),
-                     "target_tokens": target, **cmeta},
-        "phase2": {"text": answer, "n_tokens": len(c2["token_ids"]),
-                   "finish_reason": c2["finish_reason"],
-                   "ms": round((t3 - t2) * 1000),
-                   # Direct evidence of what phase 2 was actually conditioned on.
-                   "prompt_tail": p2_text[-1500:],
-                   "n_prompt_tokens": len(p2_ids),
-                   "original_trace_in_prompt": raw.strip() in p2_text,
-                   "compressed_trace_in_prompt": short.strip() in p2_text},
-    }
-    async with LOCK:
-        S["log"].write(json.dumps(record) + "\n")
-        S["log"].flush()
+        "n_prompt_tokens": len(p_ids)}))
 
-    n_prompt = len(p_ids) + len(tp) + len(splice)
     return {
         "id": rid, "object": "chat.completion", "created": int(time.time()),
         "model": body.get("model", MODEL),
-        "choices": [{"index": 0, "finish_reason": c2["finish_reason"],
-                     "message": {"role": "assistant", "content": answer,
-                                 "reasoning_content": short}}],
-        "usage": {"prompt_tokens": n_prompt,
-                  "completion_tokens": len(c2["token_ids"]),
-                  "total_tokens": n_prompt + len(c2["token_ids"])},
-        "cot_compression": {
-            "arm": arm,
-            "original_reasoning": raw,
-            "compressed_reasoning": short,
-            "reasoning_tokens": len(reasoning_ids),
-            "compressed_tokens": len(c_ids),
-            "achieved_ratio": round(len(c_ids) / max(len(reasoning_ids), 1), 4),
-            "phase1_closed": closed,
-            "original_trace_in_prompt": raw.strip() in p2_text,
-            "compressed_trace_in_prompt": short.strip() in p2_text,
-            "compressor_truncated": cmeta.get("truncated"),
-            "error": cerr,
-            "ms": {"phase1": round((t1 - t0) * 1000),
-                   "compress": round((t2 - t1) * 1000),
-                   "phase2": round((t3 - t2) * 1000)},
-        },
+        "choices": [{"index": 0, "finish_reason": res["fr2"],
+                     "message": {"role": "assistant", "content": res["answer"],
+                                 "reasoning_content": res["short"]}}],
+        "usage": {"prompt_tokens": res["n_prompt"],
+                  "completion_tokens": len(res["answer_ids"]),
+                  "total_tokens": res["n_prompt"] + len(res["answer_ids"])},
+        "cot_compression": cot_meta(res, arm),
+    }
+
+
+# --------------------------- completions route ---------------------------
+
+_UNSUPPORTED = ("echo", "suffix", "logprobs", "best_of", "prompt_logprobs")
+
+
+@app.post("/v1/completions")
+async def completions(req: Request):
+    """Same pipeline over a raw prompt.
+
+    Rejects options the pipeline cannot honour rather than silently ignoring
+    them -- a completions eval that quietly bypassed compression would report a
+    baseline number that looks like a result.
+    """
+    body = await req.json()
+    if body.get("stream"):
+        return JSONResponse({"error": {"message": "sidecar is non-streaming"}}, 400)
+    bad = [k for k in _UNSUPPORTED if body.get(k)]
+    if bad:
+        return JSONResponse({"error": {"message":
+            f"cot sidecar does not support {bad} on /v1/completions"}}, 400)
+    if int(body.get("n", 1)) != 1:
+        return JSONResponse({"error": {"message":
+            "cot sidecar supports only n=1 on /v1/completions"}}, 400)
+
+    arm = body.pop("cot_arm", ARM)
+    ratio = float(body.pop("cot_ratio", RATIO))
+    inject = body.pop("cot_inject", None)
+
+    raw_prompt = body.get("prompt")
+    add_special = body.get("add_special_tokens", True)
+    if isinstance(raw_prompt, str):
+        prompts = [raw_prompt]
+    elif isinstance(raw_prompt, list) and raw_prompt and isinstance(raw_prompt[0], int):
+        prompts = [raw_prompt]
+    elif isinstance(raw_prompt, list):
+        prompts = list(raw_prompt)
+    else:
+        return JSONResponse({"error": {"message": "invalid prompt"}}, 400)
+
+    async def tokenize_prompt(p):
+        if isinstance(p, str):
+            return (await post("/tokenize", {"model": MODEL, "prompt": p,
+                                             "add_special_tokens": add_special}))["tokens"]
+        return list(p)
+
+    temp = body.get("temperature", 0.6)
+    seed = body.get("seed")
+    common = {"temperature": temp, "top_p": body.get("top_p", 1.0), "seed": seed}
+    stop = body.get("stop") or None
+    if isinstance(stop, str):
+        stop = [stop]
+    budget = int(body.get("max_tokens") or ANSWER_BUDGET)
+
+    async def one(idx, p):
+        p_ids = await tokenize_prompt(p)
+        pkey = prompt_key(p if isinstance(p, str) else p_ids)
+        res = await cot_pipeline(p_ids, common=common, arm=arm, ratio=ratio,
+                                 inject=inject, client_stop=stop,
+                                 answer_budget=budget,
+                                 cached=S["cache"].get((pkey, seed)))
+        await write_record(build_record(res, arm=arm, ratio=ratio, pkey=pkey,
+                                        extra={
+            "id": f"cmpl-{uuid.uuid4().hex}", "endpoint": "completions",
+            "prompt": p if isinstance(p, str) else None,
+            "client_request_id": req.headers.get("x-request-id"),
+            "sampling": {"temperature": temp, "top_p": body.get("top_p", 1.0),
+                         "seed": seed, "think_budget": THINK_BUDGET,
+                         "answer_budget": budget},
+            "n_prompt_tokens": len(p_ids)}))
+        return idx, res
+
+    results = [r for _, r in sorted(await asyncio.gather(
+        *(one(i, p) for i, p in enumerate(prompts))), key=lambda x: x[0])]
+
+    n_prompt = sum(r["n_prompt"] for r in results)
+    n_out = sum(len(r["answer_ids"]) for r in results)
+    return {
+        "id": f"cmpl-{uuid.uuid4().hex}", "object": "text_completion",
+        "created": int(time.time()), "model": body.get("model", MODEL),
+        "choices": [{"index": i, "text": r["answer"], "logprobs": None,
+                     "finish_reason": r["fr2"]}
+                    for i, r in enumerate(results)],
+        "usage": {"prompt_tokens": n_prompt, "completion_tokens": n_out,
+                  "total_tokens": n_prompt + n_out},
+        "cot_compression": [cot_meta(r, arm) for r in results],
     }
 
 
