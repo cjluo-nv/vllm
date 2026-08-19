@@ -125,6 +125,51 @@ adapt this to another model:
   mid-sentence, silently turning the `self` arm into the `truncate` arm. The
   cap is now `target * 3` and `compress.truncated` is recorded.
 
+## Is phase 2 really conditioned on the compressed trace?
+
+Yes. `verify_conditioning.py` checks it two ways.
+
+**Mechanically.** The sidecar records the detokenized phase-2 prompt it actually
+sent (`phase2.prompt_tail`) plus `original_trace_in_prompt` /
+`compressed_trace_in_prompt`. For the `self` arm those read `False` / `True` --
+the original trace is absent. The prompt looks like this:
+
+```
+<|im_start|>user
+A factory produces 20 robots per hour for 6 hours, ...<|im_end|>
+<|im_start|>assistant
+<think>
+20×6 + 25×4 = 220. 85% pass: 220×0.85 = 187. ANSWER: 187
+</think>
+```
+
+Only the 44-token compressed trace sits between the think tags; the 121-token
+original is gone.
+
+**Behaviourally.** Inject two traces that reach the *same correct answer* by
+different routes (`cot_arm=inject`, `cot_inject=...`), so the model has no reason
+to override either, and see which derivation the answer uses:
+
+| injected route | answer used block method | answer used AP method |
+|---|---|---|
+| block (`5k+2`, `10k+5`) | 4/4 | 0/4 |
+| arithmetic progression (`2,7,...,997`) | 0/4 | 4/4 |
+
+Perfect separation on a 501-token-trace problem.
+
+### Caveat: conditioning strength depends on problem difficulty
+
+The same route-injection test on a *trivial* problem (121-token trace) shows no
+route dependence at all -- the model ignores the injected derivation and re-solves
+from the question. Injecting a trace that reaches a *different* answer is likewise
+stochastic: observed followed 1/1 in one run and overridden 5/5 in another, at
+temperature 0.6 with batch-composition nondeterminism.
+
+This has a direct experimental consequence: **on easy problems the compression
+arms cannot degrade, because the model is not leaning on the trace in the first
+place.** Any real measurement needs problems hard enough that re-deriving from
+scratch is expensive.
+
 ## Notes
 
 This is research tooling, not a vLLM contribution. It should not be proposed as a

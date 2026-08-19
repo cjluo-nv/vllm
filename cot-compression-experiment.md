@@ -56,7 +56,14 @@ Phase 2 then produced a complete, correctly formatted solution from that trace.
    your own whitespace handling as tokenizer drift.)
 4. **`/health` returns an empty body.** Any readiness probe that JSON-parses it
    will retry forever.
-5. **These problems are too easy to show degradation.** Traces were 121-501
+5. **Conditioning is real but difficulty-dependent.** Injecting two traces that
+   reach the same correct answer by different routes gives perfect separation on
+   the 501-token problem (block method 4/4 vs AP method 4/4, 0/4 the other way):
+   the answer follows whichever derivation it was handed. On a 121-token problem
+   there is no route dependence at all -- the model re-solves from the question
+   and ignores the trace. So on easy problems the compression arms *cannot*
+   degrade, because the trace is not load-bearing.
+6. **These problems are too easy to show degradation.** Traces were 121-501
    tokens and every arm got every answer right, including mechanical truncation.
    Real signal needs harder problems (AIME / GPQA-Diamond) and longer traces.
 

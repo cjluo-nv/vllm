@@ -233,7 +233,11 @@ async def compress_llm(raw: str, target: int, meta: dict, n_input: int) -> str:
 
 
 async def compress(raw: str, ids: list[int], arm: str, target: int,
-                   meta: dict) -> str:
+                   meta: dict, inject: str | None = None) -> str:
+    if arm == "inject":
+        if inject is None:
+            raise ValueError("arm 'inject' requires cot_inject in the request")
+        return inject
     if arm == "identity":
         return raw
     if arm == "truncate":
@@ -254,6 +258,7 @@ async def chat(req: Request):
     # Per-request overrides so one server can serve every arm.
     arm = body.pop("cot_arm", ARM)
     ratio = float(body.pop("cot_ratio", RATIO))
+    inject = body.pop("cot_inject", None)
 
     te = S["think_end"]
     tp = S["think_prefix"]
@@ -305,7 +310,8 @@ async def chat(req: Request):
     cmeta: dict = {}
     if closed:
         try:
-            short = await compress(raw, reasoning_ids, arm, target, cmeta)
+            short = await compress(raw, reasoning_ids, arm, target, cmeta,
+                                   inject)
         except Exception as e:  # noqa: BLE001
             short, cerr = raw, f"{type(e).__name__}: {e}"
     else:
@@ -321,7 +327,9 @@ async def chat(req: Request):
     t2 = time.perf_counter()
 
     # (4) phase 2: resume after the closed think block
-    p2 = {"token_ids": p_ids + tp + splice,
+    p2_ids = p_ids + tp + splice
+    p2_text = await detok(p2_ids)
+    p2 = {"token_ids": p2_ids,
           "sampling_params": {**common, "max_tokens": ANSWER_BUDGET}}
     if USE_PRIORITY:
         p2["priority"] = -1
@@ -353,7 +361,12 @@ async def chat(req: Request):
                      "target_tokens": target, **cmeta},
         "phase2": {"text": answer, "n_tokens": len(c2["token_ids"]),
                    "finish_reason": c2["finish_reason"],
-                   "ms": round((t3 - t2) * 1000)},
+                   "ms": round((t3 - t2) * 1000),
+                   # Direct evidence of what phase 2 was actually conditioned on.
+                   "prompt_tail": p2_text[-1500:],
+                   "n_prompt_tokens": len(p2_ids),
+                   "original_trace_in_prompt": raw.strip() in p2_text,
+                   "compressed_trace_in_prompt": short.strip() in p2_text},
     }
     async with LOCK:
         S["log"].write(json.dumps(record) + "\n")
@@ -377,6 +390,8 @@ async def chat(req: Request):
             "compressed_tokens": len(c_ids),
             "achieved_ratio": round(len(c_ids) / max(len(reasoning_ids), 1), 4),
             "phase1_closed": closed,
+            "original_trace_in_prompt": raw.strip() in p2_text,
+            "compressed_trace_in_prompt": short.strip() in p2_text,
             "compressor_truncated": cmeta.get("truncated"),
             "error": cerr,
             "ms": {"phase1": round((t1 - t0) * 1000),
