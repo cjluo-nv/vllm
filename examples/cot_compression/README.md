@@ -19,12 +19,18 @@ without modification.
 Same pipeline over a raw prompt. Accepts a string, a token-ID list, or a batch of
 either. Two things differ from the chat endpoint:
 
-- **A bare prompt may have no `<think>` scaffolding**, in which case there is no
-  reasoning block to compress. The sidecar detects this, returns the generation
-  untouched, and sets `no_think_block: true` with `error: "no_think_block"` — so
-  a completions eval can never silently report an uncompressed run as a
-  compressed one. Pre-render with the chat template (prompt ending in `<think>`)
-  if you want compression on this endpoint.
+- **A bare prompt may have no `<think>` scaffolding.** Phase 1 always stops at
+  `</think>` regardless, and whether reasoning happened is read off the output:
+  did phase 1 end at `</think>`? If not, that generation is the whole answer and
+  is returned untouched with `no_think_block: true`, so a completions eval can
+  never silently report an uncompressed run as a compressed one.
+
+  Arming that stop costs nothing on prompts that never reason — a stop condition
+  that does not fire cannot change the output — and it catches the case where
+  the model opens a think block *on its own*, which a decision made from the
+  prompt alone would miss. Measured: `"Write a long essay about clouds."` opens
+  no think block in the prompt, yet the model emits one, and the trace is
+  compressed 322 → 89 tokens.
 - **Unsupported options are rejected with a 400**, not ignored: `echo`, `suffix`,
   `logprobs`, `best_of`, `prompt_logprobs`, `n > 1`, `stream`.
 

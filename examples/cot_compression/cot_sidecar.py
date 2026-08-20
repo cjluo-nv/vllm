@@ -161,7 +161,8 @@ async def lifespan(app: FastAPI):
                         "messages": [{"role": "user", "content": "hi"}]})
     tail = await detok(probe["token_ids"][-24:])
     S["case_b"] = "<think>" not in tail
-    S["think_prefix"] = await tok("<think>\n") if S["case_b"] else []
+    # Used by phase 2 whenever the prompt itself did not open the block.
+    S["think_prefix_ids"] = await tok("<think>\n")
 
     # ---- compressor-side probe: is its think block already closed? ----
     cprobe = await cpost("/v1/chat/completions/render",
@@ -282,48 +283,38 @@ async def prompt_opens_think(p_ids: list[int]) -> bool:
 
 
 async def cot_pipeline(p_ids, *, common, arm, ratio, inject, client_stop,
-                       answer_budget, cached=None, expect_think=True,
+                       answer_budget, cached=None, prompt_opens=True,
                        include_stop=False):
     """think -> compress -> resume, shared by both endpoints.
 
-    ``client_stop`` is applied to phase 1 as well as phase 2. On a raw
-    /v1/completions prompt there may be no ``<think>`` scaffolding at all, in
-    which case phase 1 *is* the whole answer and must honour the caller's stop
-    strings. ``no_think`` in the result says that happened, so callers never
-    silently report an uncompressed generation as a compressed one.
-    """
-    te, tp = S["think_end"], S["think_prefix"]
-    t0 = time.perf_counter()
+    Phase 1 ALWAYS stops at ``</think>``, whether or not the prompt opened a
+    think block. A stop condition that never fires does not change the output,
+    so arming it costs nothing on prompts that never reason -- and it catches
+    the case where the model opens a think block on its own, which a decision
+    made from the prompt alone would miss.
 
-    if not expect_think:
-        # The prompt never opens a think block, so there is nothing to compress.
-        # Run exactly one generation with the caller's own parameters so the
-        # response matches what vLLM would have returned for this request.
-        sp = dict(common)
-        if answer_budget:
-            sp["max_tokens"] = answer_budget
-        if client_stop:
-            sp["stop"] = list(client_stop)
-        c = (await post("/inference/v1/generate",
-                        {"token_ids": p_ids, "sampling_params": sp}))["choices"][0]
-        ids = c["token_ids"]
-        # Match vLLM byte for byte: strip_specials() stands in for
-        # skip_special_tokens=True, trim_at_stop() for the stop-string removal.
-        # No .strip() -- vLLM preserves leading and trailing whitespace.
-        text = trim_at_stop(strip_specials(await detok(ids)),
-                            client_stop, include_stop)
-        ms = round((time.perf_counter() - t0) * 1000)
-        return {"no_think": True, "closed": False, "fr1": c["finish_reason"],
-                "reasoning_ids": [], "raw": "", "short": "", "c_ids": [],
-                "cmeta": {}, "cerr": "no_think_block", "answer": text,
-                "answer_ids": ids, "fr2": c["finish_reason"], "p2_text": "",
-                "n_prompt": len(p_ids), "target": 0, "ms": (0, 0, ms)}
+    Whether reasoning happened is then read off one fact: did phase 1 end at
+    ``</think>``? If not, phase 1 is the whole answer and is returned verbatim
+    with ``no_think`` set, so callers never report an uncompressed generation as
+    a compressed one.
+
+    ``prompt_opens`` says whether the prompt already contains the opening
+    ``<think>``. It only decides the phase-1 budget and whether phase 2 has to
+    re-insert the opening tag.
+    """
+    te = S["think_end"]
+    tp = [] if prompt_opens else S["think_prefix_ids"]
+    t0 = time.perf_counter()
 
     if cached is not None:
         reasoning_ids, closed = cached
         fr1, gen = "cached", None
     else:
-        sp = {**common, "max_tokens": THINK_BUDGET}
+        # A prompt that already opened <think> needs room to reason; one that
+        # did not is most likely an ordinary completion, so respect the
+        # caller's budget rather than burning THINK_BUDGET to find out.
+        sp = {**common,
+              "max_tokens": THINK_BUDGET if prompt_opens else answer_budget}
         stops = list(client_stop or [])
         if S["te_single"]:
             sp["stop_token_ids"] = [te]
@@ -336,16 +327,34 @@ async def cot_pipeline(p_ids, *, common, arm, ratio, inject, client_stop,
                          {"token_ids": p_ids, "sampling_params": sp}))["choices"][0]
         gen = c1["token_ids"]
         fr1 = c1["finish_reason"]
-        if S["case_b"] and gen and gen[0] == S["think_start"]:
-            gen = gen[1:]
         if S["te_single"]:
             closed = bool(gen) and gen[-1] == te
-            reasoning_ids = gen[:-1] if closed else gen
         else:
-            gen_text = await detok(gen)
-            closed = gen_text.rstrip().endswith("</think>")
-            reasoning_ids = (await tok(gen_text.rstrip()[: -len("</think>")])
-                             if closed else gen)
+            closed = (await detok(gen)).rstrip().endswith("</think>")
+
+        if not closed:
+            # Phase 1 never reached </think>, so it is the whole answer.
+            # Verbatim: strip_specials() stands in for skip_special_tokens=True
+            # and trim_at_stop() for stop-string removal; no .strip(), since
+            # vLLM preserves leading and trailing whitespace.
+            text = trim_at_stop(strip_specials(await detok(gen)),
+                                client_stop, include_stop)
+            ms = round((time.perf_counter() - t0) * 1000)
+            return {"no_think": True, "closed": False, "fr1": fr1,
+                    "reasoning_ids": [], "raw": "", "short": "", "c_ids": [],
+                    "cmeta": {}, "cerr": "no_think_block", "answer": text,
+                    "answer_ids": gen, "fr2": fr1, "p2_text": "",
+                    "n_prompt": len(p_ids), "target": 0, "ms": (0, 0, ms)}
+
+        # The model may have emitted the opening <think> itself; that tag
+        # belongs to the scaffolding, not to the trace.
+        if gen and gen[0] == S["think_start"]:
+            gen = gen[1:]
+        if S["te_single"]:
+            reasoning_ids = gen[:-1]
+        else:
+            gtext = (await detok(gen)).rstrip()
+            reasoning_ids = await tok(gtext[: -len("</think>")])
     t1 = time.perf_counter()
 
     raw = await detok(reasoning_ids)
@@ -568,16 +577,16 @@ async def chat(req: Request):
 
     # chat_template_kwargs={"enable_thinking": false} renders a *closed* empty
     # think block, so there is nothing to compress. Probe rather than assume.
-    expect = await prompt_opens_think(p_ids) or S["case_b"]
+    opens = await prompt_opens_think(p_ids)
     # Compression arms must share a fixed budget or the comparison is invalid,
-    # so ANSWER_BUDGET wins there. On the pass-through path the caller's
-    # max_tokens has to be honoured for the response to match plain vLLM.
-    budget = ANSWER_BUDGET if expect else int(body.get("max_tokens")
-                                              or ANSWER_BUDGET)
+    # so ANSWER_BUDGET wins there. When the prompt opens no think block the
+    # caller's max_tokens has to be honoured for the response to match vLLM.
+    budget = ANSWER_BUDGET if opens else int(body.get("max_tokens")
+                                             or ANSWER_BUDGET)
 
     res = await cot_pipeline(p_ids, common=common, arm=arm, ratio=ratio,
                              inject=inject, client_stop=stop,
-                             answer_budget=budget, expect_think=expect,
+                             answer_budget=budget, prompt_opens=opens,
                              include_stop=bool(body.get(
                                  "include_stop_str_in_output", False)),
                              cached=S["cache"].get((pkey, seed)))
@@ -651,10 +660,10 @@ async def completions(req: Request):
     async def one(idx, p):
         p_ids = await tokenize_prompt(p)
         pkey = prompt_key(p if isinstance(p, str) else p_ids)
-        expect = await prompt_opens_think(p_ids) or S["case_b"]
+        opens = await prompt_opens_think(p_ids)
         res = await cot_pipeline(p_ids, common=common, arm=arm, ratio=ratio,
                                  inject=inject, client_stop=stop,
-                                 answer_budget=budget, expect_think=expect,
+                                 answer_budget=budget, prompt_opens=opens,
                                  include_stop=include_stop,
                                  cached=S["cache"].get((pkey, seed)))
         await write_record(build_record(res, arm=arm, ratio=ratio, pkey=pkey,

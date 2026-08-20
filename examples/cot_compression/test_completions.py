@@ -173,6 +173,29 @@ def main():
     print("  (both should use the model's generation_config defaults)")
 
     print("\n" + "=" * 74)
+    print("6. spontaneous <think> on a bare prompt is caught and compressed")
+    print("=" * 74)
+    # The prompt opens no think block, but this model emits one on its own for
+    # open-ended requests. Because phase 1 always stops at </think>, that is now
+    # detected from the OUTPUT rather than assumed absent from the prompt.
+    r = post(url, {"model": a.model, "prompt": "Write a long essay about clouds.",
+                   "temperature": 0.6, "top_p": 0.95, "seed": 99,
+                   "max_tokens": 2048, "cot_arm": "self", "cot_ratio": 0.3})
+    cc = r["cot_compression"][0]
+    show(cc, "spontaneous")
+    print(f"  text: {r['choices'][0]['text'][:150]!r}")
+    if cc["no_think_block"]:
+        print("  NOTE: model did not open a think block on this run; "
+              "nothing to catch (sampling-dependent, not a failure)")
+    else:
+        if cc["compressed_tokens"] >= cc["reasoning_tokens"]:
+            fails.append("6: spontaneous trace was not compressed")
+        if cc["original_trace_in_prompt"]:
+            fails.append("6: original trace leaked into the phase-2 prompt")
+        if not cc["compressed_trace_in_prompt"]:
+            fails.append("6: compressed trace absent from the phase-2 prompt")
+
+    print("\n" + "=" * 74)
     for f in fails:
         print(f"FAIL  {f}")
     if not fails:
