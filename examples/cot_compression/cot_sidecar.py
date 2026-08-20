@@ -435,6 +435,27 @@ def build_record(res, *, arm, ratio, pkey, extra):
     return rec
 
 
+def normalize_stop(stop):
+    """OpenAI allows `stop` to be a bare string. Without this, `list("END")`
+    yields ['E','N','D'] and generation stops on the first letter E."""
+    if stop is None or stop == []:
+        return None
+    return [stop] if isinstance(stop, str) else list(stop)
+
+
+def reject_unsupported(body, unsupported):
+    """Options the two-phase pipeline cannot honour. Returning a plausible
+    looking response for these would be worse than failing."""
+    if body.get("stream"):
+        return "sidecar is non-streaming"
+    bad = [k for k in unsupported if body.get(k)]
+    if bad:
+        return f"cot sidecar does not support {bad}"
+    if int(body.get("n", 1) or 1) != 1:
+        return "cot sidecar supports only n=1"
+    return None
+
+
 def trim_at_stop(text: str, stops, include: bool) -> str:
     """Replicate vLLM's stop-string handling.
 
@@ -528,8 +549,9 @@ def cot_meta(res, arm):
 @app.post("/v1/chat/completions")
 async def chat(req: Request):
     body = await req.json()
-    if body.get("stream"):
-        return JSONResponse({"error": {"message": "sidecar is non-streaming"}}, 400)
+    err = reject_unsupported(body, ("logprobs", "top_logprobs"))
+    if err:
+        return JSONResponse({"error": {"message": err}}, 400)
 
     arm = body.pop("cot_arm", ARM)
     ratio = float(body.pop("cot_ratio", RATIO))
@@ -537,15 +559,25 @@ async def chat(req: Request):
 
     seed = body.get("seed")
     common = sampling_common(body)
+    stop = normalize_stop(body.get("stop"))
     pkey = prompt_key(body["messages"])
 
     rendered = await post("/v1/chat/completions/render",
                           {**body, "stream": False, "max_tokens": 1})
     p_ids = rendered["token_ids"]
 
+    # chat_template_kwargs={"enable_thinking": false} renders a *closed* empty
+    # think block, so there is nothing to compress. Probe rather than assume.
+    expect = await prompt_opens_think(p_ids) or S["case_b"]
+    # Compression arms must share a fixed budget or the comparison is invalid,
+    # so ANSWER_BUDGET wins there. On the pass-through path the caller's
+    # max_tokens has to be honoured for the response to match plain vLLM.
+    budget = ANSWER_BUDGET if expect else int(body.get("max_tokens")
+                                              or ANSWER_BUDGET)
+
     res = await cot_pipeline(p_ids, common=common, arm=arm, ratio=ratio,
-                             inject=inject, client_stop=body.get("stop"),
-                             answer_budget=ANSWER_BUDGET,
+                             inject=inject, client_stop=stop,
+                             answer_budget=budget, expect_think=expect,
                              include_stop=bool(body.get(
                                  "include_stop_str_in_output", False)),
                              cached=S["cache"].get((pkey, seed)))
@@ -555,7 +587,7 @@ async def chat(req: Request):
         "id": rid, "endpoint": "chat", "messages": body["messages"],
         "client_request_id": req.headers.get("x-request-id"),
         "sampling": {**common, "think_budget": THINK_BUDGET,
-                     "answer_budget": ANSWER_BUDGET},
+                     "answer_budget": budget},
         "n_prompt_tokens": len(p_ids)}))
 
     return {
@@ -585,15 +617,9 @@ async def completions(req: Request):
     baseline number that looks like a result.
     """
     body = await req.json()
-    if body.get("stream"):
-        return JSONResponse({"error": {"message": "sidecar is non-streaming"}}, 400)
-    bad = [k for k in _UNSUPPORTED if body.get(k)]
-    if bad:
-        return JSONResponse({"error": {"message":
-            f"cot sidecar does not support {bad} on /v1/completions"}}, 400)
-    if int(body.get("n", 1)) != 1:
-        return JSONResponse({"error": {"message":
-            "cot sidecar supports only n=1 on /v1/completions"}}, 400)
+    err = reject_unsupported(body, _UNSUPPORTED)
+    if err:
+        return JSONResponse({"error": {"message": err}}, 400)
 
     arm = body.pop("cot_arm", ARM)
     ratio = float(body.pop("cot_ratio", RATIO))
@@ -618,9 +644,7 @@ async def completions(req: Request):
 
     seed = body.get("seed")
     common = sampling_common(body)
-    stop = body.get("stop") or None
-    if isinstance(stop, str):
-        stop = [stop]
+    stop = normalize_stop(body.get("stop"))
     budget = int(body.get("max_tokens") or ANSWER_BUDGET)
     include_stop = bool(body.get("include_stop_str_in_output", False))
 
