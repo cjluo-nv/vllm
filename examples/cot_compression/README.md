@@ -47,6 +47,79 @@ token-in / token-out API:
 | `POST /inference/v1/generate` | token IDs -> token IDs |
 | `POST /tokenize` / `POST /detokenize` | text <-> token IDs |
 
+## How it works
+
+The sidecar is a broker: its own HTTP server that sits between the client and
+vLLM, and turns one inbound request into three generations.
+
+```
+client ──POST /v1/chat/completions──► sidecar :9000
+                                        │
+   1. POST /v1/chat/completions/render  ├──► vLLM   messages -> prompt token IDs (p_ids)
+   2. POST /inference/v1/generate       ├──► vLLM   GEN 1: p_ids, stop at </think>
+      POST /detokenize                  ├──► vLLM   reasoning IDs -> text
+   3. POST /v1/chat/completions/render  ├──► vLLM   NEW prompt: "compress this trace"
+   4. POST /inference/v1/generate       ├──► vLLM   GEN 2: compressor, thinking OFF
+      POST /tokenize                    ├──► vLLM   compressed text -> token IDs
+   5. POST /inference/v1/generate       ├──► vLLM   GEN 3: p_ids + compressed + </think>
+      POST /detokenize                  ├──► vLLM   answer IDs -> text
+                                        │
+client ◄────── OpenAI response ─────────┘
+```
+
+Three GPU generations; everything else is a CPU-side tokenizer call on the vLLM
+server. The three generations arrive as three *independent* vLLM requests --
+vLLM has no idea they are related and simply batches them alongside everything
+else, so continuous batching is unaffected.
+
+`</think>` appears in two mechanically different roles:
+
+- **GEN 1** arms it as a *stop condition* (`sampling_params.stop_token_ids`).
+  Nothing is added to the prompt; this only tells vLLM when to halt.
+- **GEN 3** appends it as *prompt text*, closing the block after the compressed
+  trace so the model knows reasoning is over.
+
+GEN 2 is a **fresh, independent request**, not a continuation: a new system and
+user turn containing the trace, rendered with `enable_thinking: false` so the
+compressor answers directly instead of reasoning about how to compress.
+
+### Why step 1 returns token IDs rather than reusing `messages`
+
+GEN 3's prompt is `p_ids + compressed + </think>` -- the compressed trace is
+spliced *inside* the assistant turn, between the think tags. There is no way to
+express that by resending `messages` to `/v1/chat/completions`; the chat API
+cannot prefill a partial think block. Working in token IDs also means:
+
+- **no re-tokenization drift on the prompt.** `p_ids` is produced once and
+  reused byte-for-byte in GEN 3, never detokenized and re-tokenized. This is
+  what the `identity` arm's `retok_identical` measures.
+- **a guaranteed prefix-cache hit.** GEN 3's prompt starts with exactly the same
+  tokens as GEN 1's, so vLLM reuses that KV and only prefills the compressed
+  trace -- which is the efficiency claim the whole experiment rests on.
+
+### Why the trace is detokenized before GEN 2
+
+It could be avoided. The static parts of the compression prompt could be
+pre-tokenized at startup and the raw reasoning token IDs concatenated directly,
+so GEN 1 and GEN 2 never touch text. That is the tidier design and it is
+marginally more robust on tokenizers where the detokenize/tokenize round trip is
+not the identity (it *is* the identity here -- measured, `retok_identical` true
+on every record).
+
+It is not done because the saving is negligible and the text is needed anyway:
+
+- The calls it would remove are one `/detokenize` and one `/render`, both
+  CPU-side, together a few milliseconds against 3-10 seconds of GPU time -- on
+  the order of 0.1%.
+- The trace text is written to the log regardless, since a log of raw token IDs
+  would not be readable. So the detokenize is not extra work.
+- The `truncate` and `identity` arms operate on text.
+- Building a natural-language prompt by token concatenation puts an untested
+  seam at the `<trace>\n` boundary, for no measurable gain.
+
+The rule applied throughout: work at the token level where correctness depends
+on it (the spliced GEN 3 prompt), not where it is merely tidier.
+
 ## Running
 
 vLLM and the sidecar are two servers, so they are two processes. One shell is
