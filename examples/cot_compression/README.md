@@ -49,22 +49,37 @@ token-in / token-out API:
 
 ## Running
 
+vLLM and the sidecar are two servers, so they are two processes. One shell is
+fine — nothing here needs separate terminals:
+
 ```bash
-# terminal 1
-vllm serve <model> --served-model-name m --port 8000
+# 1. vLLM, unchanged
+vllm serve <model> --served-model-name m --port 8000 &
 
-# terminal 2
+# 2. sidecar (waits for vLLM to become healthy before serving)
 VLLM_URL=http://127.0.0.1:8000 MODEL=m ARM=self RATIO=0.3 \
-  TRACE_LOG=traces.jsonl python3 cot_sidecar.py
+  TRACE_LOG=traces.jsonl python3 cot_sidecar.py &
 
-# terminal 3
+# 3. point any harness at 9000 instead of 8000
 python3 test_sidecar.py --model m
 ```
 
-On GCP-NRT, `run_gcp_nrt.sbatch` does all three inside the container:
+`run_gcp_nrt.sbatch` does exactly this inside the container:
 
 ```bash
 sbatch examples/cot_compression/run_gcp_nrt.sbatch
+```
+
+Keeping the sidecar out of the vLLM process is deliberate. Restarting it to
+change `ARM`, `RATIO`, or the compression prompt takes ~12 s; restarting vLLM to
+reload a 27B checkpoint, re-run torch.compile and recapture CUDA graphs takes
+~320 s. It also lets several sidecars share one vLLM, which is how to run every
+arm concurrently on a single GPU:
+
+```bash
+SIDECAR_PORT=9000 ARM=identity TRACE_LOG=identity.jsonl python3 cot_sidecar.py &
+SIDECAR_PORT=9001 ARM=truncate TRACE_LOG=truncate.jsonl python3 cot_sidecar.py &
+SIDECAR_PORT=9002 ARM=self     TRACE_LOG=self.jsonl     python3 cot_sidecar.py &
 ```
 
 ## Configuration
