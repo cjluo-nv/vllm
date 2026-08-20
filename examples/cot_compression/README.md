@@ -53,24 +53,51 @@ The sidecar is a broker: its own HTTP server that sits between the client and
 vLLM, and turns one inbound request into three generations.
 
 ```
+STARTUP (once)
+  C_PREFIX    = compression system+user turn up to "<trace>\n", pre-tokenized
+  THINK_CLOSE = tok("\n</think>\n\n")
+
 client ──POST /v1/chat/completions──► sidecar :9000
                                         │
-   1. POST /v1/chat/completions/render  ├──► vLLM   messages -> prompt token IDs (p_ids)
-   2. POST /inference/v1/generate       ├──► vLLM   GEN 1: p_ids, stop at </think>
-      POST /detokenize                  ├──► vLLM   reasoning IDs -> text
-   3. POST /v1/chat/completions/render  ├──► vLLM   NEW prompt: "compress this trace"
-   4. POST /inference/v1/generate       ├──► vLLM   GEN 2: compressor, thinking OFF
-      POST /tokenize                    ├──► vLLM   compressed text -> token IDs
-   5. POST /inference/v1/generate       ├──► vLLM   GEN 3: p_ids + compressed + </think>
-      POST /detokenize                  ├──► vLLM   answer IDs -> text
+  1. POST /v1/chat/completions/render   ├──► vLLM   messages → p_ids   [LRU cached]
+     (prompt_opens: scan p_ids for think_start/think_end — pure Python)
+                                        │
+  2. POST /inference/v1/generate        ├──► vLLM   ⚡ GEN 1: p_ids, stop at </think>
+                                        │
+  3. POST /tokenize (~40 tok)           ├──► vLLM   per-request budget tail
+  4. POST /inference/v1/generate        ├──► vLLM   ⚡ GEN 2: C_PREFIX + reasoning_ids + tail
+     ╎ concurrent, latency-hidden       ╎           (trace spliced in as RAW TOKEN IDS)
+     ╎ POST /detokenize(reasoning_ids)  ├──► vLLM   trace text → log only
+                                        │
+     (splice   = compressed_ids + THINK_CLOSE  — pure Python)
+     (provenance = token subsequence test      — pure Python)
+                                        │
+  5. POST /inference/v1/generate        ├──► vLLM   ⚡ GEN 3: p_ids + splice
+     ╎ concurrent, latency-hidden       ╎
+     ╎ POST /detokenize(compressed_ids) ├──► vLLM   compressed text → log only
+     ╎ POST /detokenize(p2_ids[-256:])  ├──► vLLM   prompt tail → log only
+                                        │
+  6. POST /detokenize(answer_ids)       ├──► vLLM   answer → response
                                         │
 client ◄────── OpenAI response ─────────┘
+
+8 upstream calls, 3 of them GPU; 3 of the rest are log-only and run
+concurrently with a generation, so the critical path is 5.
 ```
 
 Three GPU generations; everything else is a CPU-side tokenizer call on the vLLM
 server. The three generations arrive as three *independent* vLLM requests --
 vLLM has no idea they are related and simply batches them alongside everything
 else, so continuous batching is unaffected.
+
+**Every arm is a token-IDs -> token-IDs function.** `identity` returns the trace
+unchanged, `truncate` slices it, `self` returns GEN 2's output. The trace never
+round-trips through text on the way to the compressor, so no tokenizer drift can
+be introduced. Text is produced only for the log.
+
+Because drift is now impossible by construction, `retok_identical` is `null` by
+default. Set `MEASURE_RETOK=1` to spend one extra `/tokenize` per request and
+characterise a new tokenizer before trusting it.
 
 `</think>` appears in two mechanically different roles:
 
@@ -97,7 +124,20 @@ cannot prefill a partial think block. Working in token IDs also means:
   tokens as GEN 1's, so vLLM reuses that KV and only prefills the compressed
   trace -- which is the efficiency claim the whole experiment rests on.
 
-### Why the trace is detokenized before GEN 2
+### Why the compression prefix is pre-tokenized
+
+`C_PREFIX` is built once at startup by rendering the compression prompt with a
+sentinel where the trace goes, then splitting on it. That keeps it
+template-agnostic -- the assistant turn opener and the closed empty think block
+come from the template's `enable_thinking` branch, never from strings hardcoded
+here. The split is only used if re-tokenizing the prefix reproduces the rendered
+token IDs exactly; otherwise the sidecar logs a warning and falls back to a
+render per request.
+
+This is why the budget is stated *after* the trace rather than before it: any
+per-request number in the prefix would make the prefix dynamic and unshareable.
+
+### Historical note: why the trace used to be detokenized before GEN 2
 
 It could be avoided. The static parts of the compression prompt could be
 pre-tokenized at startup and the raw reasoning token IDs concatenated directly,

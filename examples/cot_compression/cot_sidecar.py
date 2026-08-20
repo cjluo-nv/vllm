@@ -41,6 +41,9 @@ USE_PRIORITY = os.environ.get("USE_PRIORITY", "0") == "1"
 LOG_QUEUE_MAX = int(os.environ.get("LOG_QUEUE_MAX", "20000"))
 LOG_BATCH = int(os.environ.get("LOG_BATCH", "64"))
 LOG_FLUSH_SECS = float(os.environ.get("LOG_FLUSH_SECS", "2.0"))
+MEASURE_RETOK = os.environ.get("MEASURE_RETOK", "0") == "1"
+RENDER_CACHE_MAX = int(os.environ.get("RENDER_CACHE_MAX", "4096"))
+_TRACE_SLOT = "@@COT_TRACE_SLOT@@"
 COMPRESS_PROMPT_VERSION = "v1"
 
 JSON_HDR = {"content-type": "application/json"}
@@ -59,6 +62,18 @@ S: dict = {}
 # formatting style". Combined with greedy decoding that made verbatim copying the
 # easiest continuation, and the compressor reproduced the trace unchanged until it
 # hit max_tokens. Brevity has to be the dominant instruction.
+# The trace is spliced between these two halves as raw token IDs. Everything
+# before it is static and pre-tokenized once at startup; only the tail carries
+# per-request numbers. That is why the budget is stated after the trace rather
+# than before it.
+COMPRESS_USER_HEAD = "Compress the reasoning trace below.\n\n<trace>\n"
+COMPRESS_USER_TAIL = (
+    "\n</trace>\n\n"
+    "Compress it to at most {TGT} tokens (roughly {WRD} words). The input is "
+    "{NIN} tokens, so your output must be far shorter. "
+    "Remember: at most {TGT} tokens, and never copy verbatim."
+)
+
 COMPRESS_SYS = (
     "You compress reasoning traces. You are given a model's intermediate "
     "reasoning. Rewrite it so it is SUBSTANTIALLY SHORTER than the input while "
@@ -76,6 +91,7 @@ COMPRESS_SYS = (
 
 
 async def _post(client: httpx.AsyncClient, path: str, payload: dict) -> dict:
+    S["http_calls"] = S.get("http_calls", 0) + 1
     r = await client.post(path, content=json.dumps(payload).encode(), headers=JSON_HDR)
     if r.status_code >= 400:
         raise RuntimeError(f"{path} -> {r.status_code}: {r.text[:400]}")
@@ -173,6 +189,40 @@ async def lifespan(app: FastAPI):
     S["nothink"] = ([] if ("<think>" not in ctail or "</think>" in ctail)
                     else [S["think_end"]])
 
+    S["think_close"] = await tok("\n</think>\n\n")
+    S["special_ids"] = set()
+    for sp in S["special_strs"]:
+        sp_ids = await tok(sp)
+        if len(sp_ids) == 1:
+            S["special_ids"].add(sp_ids[0])
+
+    # Render the compression prompt once with a sentinel where the trace goes,
+    # then split. Keeps this template-agnostic: the assistant turn opener and
+    # the closed empty think block come from the template's enable_thinking
+    # branch, never from hardcoded strings here.
+    cmsgs = [{"role": "system", "content": COMPRESS_SYS},
+             {"role": "user", "content": COMPRESS_USER_HEAD + _TRACE_SLOT
+              + COMPRESS_USER_TAIL}]
+    crend = await cpost("/v1/chat/completions/render",
+                        {"model": COMPRESSOR_MODEL, "messages": cmsgs,
+                         "max_tokens": 1,
+                         "chat_template_kwargs": {"enable_thinking": False}})
+    cfull = await detok(crend["token_ids"])
+    S["prefix_ok"] = False
+    if _TRACE_SLOT in cfull:
+        cut = cfull.index(_TRACE_SLOT)
+        prefix_ids = await tok(cfull[:cut])
+        # Only usable if re-tokenizing the prefix reproduces the rendered tokens
+        # exactly; otherwise fall back to rendering per request.
+        if crend["token_ids"][: len(prefix_ids)] == prefix_ids:
+            S["c_prefix"] = prefix_ids
+            S["mid_tpl"] = cfull[cut + len(_TRACE_SLOT):]
+            S["prefix_ok"] = True
+    if not S["prefix_ok"]:
+        print("[sidecar] WARNING: could not pre-tokenize the compression "
+              "prefix; falling back to a render per request", flush=True)
+
+    S["render_cache"] = {}
     S["cache"] = load_trace_cache(TRACE_CACHE_GLOB) if TRACE_CACHE_GLOB else {}
     S["log"] = (gzip.open(TRACE_LOG, "at") if TRACE_LOG.endswith(".gz")
                 else open(TRACE_LOG, "a"))
@@ -185,6 +235,8 @@ async def lifespan(app: FastAPI):
               "string stop and re-tokenizing the trace body.", flush=True)
     print(f"[sidecar] main prompt tail={tail!r} case_b={S['case_b']}", flush=True)
     print(f"[sidecar] compressor tail={ctail!r} nothink={S['nothink']}", flush=True)
+    print(f"[sidecar] compression prefix pre-tokenized: {S['prefix_ok']} "
+          f"({len(S.get('c_prefix', []))} tokens)", flush=True)
     print(f"[sidecar] arm={ARM} ratio={RATIO} cache={len(S['cache'])}", flush=True)
     writer = asyncio.create_task(log_writer())
     try:
@@ -202,35 +254,48 @@ app = FastAPI(lifespan=lifespan)
 
 
 # --------------------------- compression arms ---------------------------
+# Every arm is a token-IDs -> token-IDs function. The trace never round-trips
+# through text on the way to the compressor, so no tokenizer drift can be
+# introduced here. Text is produced only for the log, off the critical path.
 
-async def truncate_head_tail(ids: list[int], target: int) -> str:
+
+def truncate_head_tail_ids(ids: list[int], target: int) -> list[int]:
     if len(ids) <= target:
-        return await detok(ids)
+        return list(ids)
     head = target // 2
-    keep = ids[:head] + ids[len(ids) - (target - head):]
-    return await detok(keep)
+    return list(ids[:head]) + list(ids[len(ids) - (target - head):])
 
 
-async def compress_llm(raw: str, target: int, meta: dict, n_input: int) -> str:
-    """Self-compression: same vLLM server, compressor's own thinking disabled."""
-    msgs = [
-        {"role": "system", "content": COMPRESS_SYS},
-        {"role": "user",
-         "content": (
-             f"Compress the trace below to at most {target} tokens "
-             f"(roughly {max(8, int(target * 0.75))} words). The input is "
-             f"{n_input} tokens, so your output must be far shorter.\n\n"
-             f"<trace>\n{raw}\n</trace>\n\n"
-             f"Remember: at most {target} tokens, and never copy verbatim.")},
-    ]
-    rendered = await cpost("/v1/chat/completions/render",
-                           {"model": COMPRESSOR_MODEL, "messages": msgs,
-                            "max_tokens": 1,
-                            "chat_template_kwargs": {"enable_thinking": False}})
-    pc = rendered["token_ids"] + S["nothink"]
-    # Headroom matters: if the compressor is cut off at max_tokens the result is
-    # a truncated compression, which silently turns this arm into the truncate
-    # arm. Give it room, then measure what it actually produced.
+def _strip_trailing_specials(ids: list[int]) -> list[int]:
+    out = list(ids)
+    while out and out[-1] in S["special_ids"]:
+        out.pop()
+    return out
+
+
+async def compress_llm_ids(raw_ids: list[int], target: int, meta: dict,
+                           n_input: int) -> list[int]:
+    """Self-compression with the trace spliced in as raw token IDs."""
+    words = max(8, int(target * 0.75))
+    tail = (S["mid_tpl"].replace("{TGT}", str(target))
+            .replace("{WRD}", str(words)).replace("{NIN}", str(n_input)))
+    tail_ids = await tok(tail)
+
+    if S["prefix_ok"]:
+        pc = S["c_prefix"] + list(raw_ids) + tail_ids + S["nothink"]
+    else:  # template could not be split; fall back to a render per request
+        raw_text = await detok(raw_ids)
+        msgs = [{"role": "system", "content": COMPRESS_SYS},
+                {"role": "user", "content": COMPRESS_USER_HEAD + raw_text
+                 + tail}]
+        rendered = await cpost("/v1/chat/completions/render",
+                               {"model": COMPRESSOR_MODEL, "messages": msgs,
+                                "max_tokens": 1,
+                                "chat_template_kwargs": {"enable_thinking": False}})
+        pc = rendered["token_ids"] + S["nothink"]
+
+    # Headroom matters: a compressor cut off at max_tokens is a truncated
+    # compression, which silently turns this arm into the truncate arm.
     cap = max(128, int(target * 3))
     out = await cpost("/inference/v1/generate", {
         "token_ids": pc,
@@ -240,23 +305,35 @@ async def compress_llm(raw: str, target: int, meta: dict, n_input: int) -> str:
     meta["compressor_finish_reason"] = choice["finish_reason"]
     meta["compressor_cap"] = cap
     meta["truncated"] = choice["finish_reason"] == "length"
-    text = await detok(choice["token_ids"])
-    return strip_specials(text).strip()
+    return _strip_trailing_specials(choice["token_ids"])
 
 
-async def compress(raw: str, ids: list[int], arm: str, target: int,
-                   meta: dict, inject: str | None = None) -> str:
+async def compress_ids(raw_ids: list[int], arm: str, target: int, meta: dict,
+                       inject: str | None) -> list[int]:
     if arm == "inject":
         if inject is None:
             raise ValueError("arm 'inject' requires cot_inject in the request")
-        return inject
+        return await tok(inject)
     if arm == "identity":
-        return raw
+        return list(raw_ids)
     if arm == "truncate":
-        return await truncate_head_tail(ids, target)
+        return truncate_head_tail_ids(raw_ids, target)
     if arm == "self":
-        return await compress_llm(raw, target, meta, len(ids))
+        return await compress_llm_ids(raw_ids, target, meta, len(raw_ids))
     raise ValueError(f"unknown arm {arm!r}")
+
+
+def contains_subseq(needle: list[int], hay: list[int]) -> bool:
+    """Exact token-level provenance, replacing a string containment test that
+    could be fooled by whitespace handling."""
+    n = len(needle)
+    if n == 0:
+        return False
+    first = needle[0]
+    for i in range(len(hay) - n + 1):
+        if hay[i] == first and hay[i:i + n] == needle:
+            return True
+    return False
 
 
 # --------------------------- shared pipeline ----------------------------
@@ -276,10 +353,31 @@ def sampling_common(body: dict) -> dict:
     return {k: body[k] for k in _SAMPLING_KEYS if body.get(k) is not None}
 
 
-async def prompt_opens_think(p_ids: list[int]) -> bool:
-    """True if the prompt ends inside an unclosed <think> block."""
-    tail = await detok(p_ids[-64:])
-    return tail.rfind("<think>") > tail.rfind("</think>")
+def prompt_opens_think(p_ids: list[int]) -> bool:
+    """True if the prompt ends inside an unclosed <think> block.
+
+    Done on token IDs rather than by detokenizing a tail, so it costs no HTTP
+    call and cannot be confused by text that merely mentions the tags.
+    """
+    ts, te = S["think_start"], S["think_end"]
+    last_open = last_close = -1
+    for i, t in enumerate(p_ids):
+        if t == ts:
+            last_open = i
+        elif t == te:
+            last_close = i
+    return last_open > last_close
+
+
+def render_key(body: dict) -> str:
+    """Everything that can change the rendered prompt. Sampling params cannot,
+    so the same messages across arms and seeds reuse one render."""
+    return hashlib.sha256(json.dumps({
+        "messages": body.get("messages"),
+        "ctk": body.get("chat_template_kwargs"),
+        "tools": body.get("tools"),
+        "tpl": body.get("chat_template"),
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 async def cot_pipeline(p_ids, *, common, arm, ratio, inject, client_stop,
@@ -343,7 +441,9 @@ async def cot_pipeline(p_ids, *, common, arm, ratio, inject, client_stop,
             return {"no_think": True, "closed": False, "fr1": fr1,
                     "reasoning_ids": [], "raw": "", "short": "", "c_ids": [],
                     "cmeta": {}, "cerr": "no_think_block", "answer": text,
-                    "answer_ids": gen, "fr2": fr1, "p2_text": "",
+                    "answer_ids": gen, "fr2": fr1, "p2_tail": "",
+                    "orig_in_p2": None, "comp_in_p2": None,
+                    "roundtrip_ids": None,
                     "n_prompt": len(p_ids), "target": 0, "ms": (0, 0, ms)}
 
         # The model may have emitted the opening <think> itself; that tag
@@ -357,55 +457,66 @@ async def cot_pipeline(p_ids, *, common, arm, ratio, inject, client_stop,
             reasoning_ids = await tok(gtext[: -len("</think>")])
     t1 = time.perf_counter()
 
-    raw = await detok(reasoning_ids)
-
-    # No </think> and phase 1 ended on its own terms: there was no reasoning
-    # block to compress and this generation is already the complete answer.
-    # Hand it back untouched rather than force-closing a block that never opened.
-    no_think = (not closed) and fr1 in ("stop", "cached")
-    if no_think:
+    # The live path already returned above if phase 1 never reached </think>.
+    # This only covers a cached trace that was recorded as unclosed.
+    if (not closed) and fr1 == "cached":
+        raw = await detok(reasoning_ids)
         return {"no_think": True, "closed": False, "fr1": fr1,
-                "reasoning_ids": reasoning_ids, "raw": raw, "short": raw,
-                "c_ids": reasoning_ids, "cmeta": {}, "cerr": "no_think_block",
-                "answer": strip_specials(raw).strip(),
-                "answer_ids": reasoning_ids, "fr2": fr1, "p2_text": "",
-                "n_prompt": len(p_ids), "target": 0,
+                "reasoning_ids": [], "raw": "", "short": "", "c_ids": [],
+                "cmeta": {}, "cerr": "no_think_block",
+                "answer": trim_at_stop(strip_specials(raw), client_stop,
+                                       include_stop),
+                "answer_ids": reasoning_ids, "fr2": fr1, "p2_tail": "",
+                "orig_in_p2": None, "comp_in_p2": None,
+                "n_prompt": len(p_ids), "target": 0, "roundtrip_ids": None,
                 "ms": (round((t1 - t0) * 1000), 0, 0)}
+
+    # The trace text is only needed for the log, and the compressor now takes
+    # raw token IDs, so detokenize it alongside GEN 2 rather than before it.
+    raw_task = asyncio.create_task(detok(reasoning_ids))
 
     target = max(16, int(len(reasoning_ids) * ratio))
     cerr, cmeta = None, {}
-    if closed:
-        try:
-            short = await compress(raw, reasoning_ids, arm, target, cmeta, inject)
-        except Exception as e:  # noqa: BLE001
-            short, cerr = raw, f"{type(e).__name__}: {e}"
-    else:
-        short, cerr = raw, "phase1_not_closed"
-    short = short.rstrip()
-
-    c_ids = await tok(short)
-    splice = await tok(short + "\n</think>\n\n")
-    roundtrip_ids = await tok(raw)
+    try:
+        c_ids = await compress_ids(reasoning_ids, arm, target, cmeta, inject)
+    except Exception as e:  # noqa: BLE001
+        c_ids, cerr = list(reasoning_ids), f"{type(e).__name__}: {e}"
     t2 = time.perf_counter()
 
+    # Pre-tokenized close tag; no tokenize call, and the seam is a newline.
+    splice = list(c_ids) + S["think_close"]
     p2_ids = p_ids + tp + splice
-    p2_text = await detok(p2_ids)
     p2 = {"token_ids": p2_ids,
           "sampling_params": {**common, "max_tokens": answer_budget}}
     if client_stop:
         p2["sampling_params"]["stop"] = list(client_stop)
     if USE_PRIORITY:
         p2["priority"] = -1
-    c2 = (await post("/inference/v1/generate", p2))["choices"][0]
+
+    # GEN 3 runs while the two log-only detokenizes are in flight.
+    gen3 = asyncio.create_task(post("/inference/v1/generate", p2))
+    short_task = asyncio.create_task(detok(c_ids))
+    tail_task = asyncio.create_task(detok(p2_ids[-256:]))
+
+    c2 = (await gen3)["choices"][0]
     answer = trim_at_stop(strip_specials(await detok(c2["token_ids"])),
                           client_stop, include_stop).strip()
     t3 = time.perf_counter()
+
+    raw = await raw_task
+    short = await short_task
+    p2_tail = await tail_task
+    # Drift can no longer be introduced (the trace never round-trips), so this
+    # is an opt-in characterisation of a new tokenizer, not a routine check.
+    roundtrip_ids = await tok(raw) if MEASURE_RETOK else None
 
     return {"no_think": False, "closed": closed, "fr1": fr1,
             "reasoning_ids": reasoning_ids, "raw": raw, "short": short,
             "c_ids": c_ids, "roundtrip_ids": roundtrip_ids, "cmeta": cmeta,
             "cerr": cerr, "answer": answer, "answer_ids": c2["token_ids"],
-            "fr2": c2["finish_reason"], "p2_text": p2_text,
+            "fr2": c2["finish_reason"], "p2_tail": p2_tail,
+            "orig_in_p2": contains_subseq(reasoning_ids, p2_ids),
+            "comp_in_p2": contains_subseq(list(c_ids), p2_ids),
             "n_prompt": len(p2_ids), "target": target,
             "ms": (round((t1 - t0) * 1000), round((t2 - t1) * 1000),
                    round((t3 - t2) * 1000))}
@@ -414,7 +525,7 @@ async def cot_pipeline(p_ids, *, common, arm, ratio, inject, client_stop,
 def build_record(res, *, arm, ratio, pkey, extra):
     m1, mc, m2 = res["ms"]
     rec = {
-        "schema": 2, "ts": time.time(), "arm": arm, "ratio_requested": ratio,
+        "schema": 3, "ts": time.time(), "arm": arm, "ratio_requested": ratio,
         "compress_prompt_version": COMPRESS_PROMPT_VERSION, "prompt_key": pkey,
         "phase1": {"text": res["raw"], "token_ids": res["reasoning_ids"],
                    "n_tokens": len(res["reasoning_ids"]),
@@ -424,21 +535,17 @@ def build_record(res, *, arm, ratio, pkey, extra):
                      "n_tokens": len(res["c_ids"]),
                      "achieved_ratio": len(res["c_ids"])
                      / max(len(res["reasoning_ids"]), 1),
-                     "retok_identical": res.get("roundtrip_ids")
-                     == res["reasoning_ids"],
-                     "roundtrip_n_tokens": len(res.get("roundtrip_ids") or []),
+                     "retok_identical":
+                         None if res.get("roundtrip_ids") is None
+                         else res["roundtrip_ids"] == res["reasoning_ids"],
                      "error": res["cerr"], "ms": mc,
                      "target_tokens": res["target"], **res["cmeta"]},
         "phase2": {"text": res["answer"], "n_tokens": len(res["answer_ids"]),
                    "finish_reason": res["fr2"], "ms": m2,
-                   "prompt_tail": res["p2_text"][-1500:],
+                   "prompt_tail": res["p2_tail"],
                    "n_prompt_tokens": res["n_prompt"],
-                   "original_trace_in_prompt":
-                       None if res["no_think"]
-                       else res["raw"].strip() in res["p2_text"],
-                   "compressed_trace_in_prompt":
-                       None if res["no_think"]
-                       else res["short"].strip() in res["p2_text"]},
+                   "original_trace_in_prompt": res["orig_in_p2"],
+                   "compressed_trace_in_prompt": res["comp_in_p2"]},
     }
     rec.update(extra)
     return rec
@@ -543,10 +650,8 @@ def cot_meta(res, arm):
                                 / max(len(res["reasoning_ids"]), 1), 4),
         "phase1_closed": res["closed"],
         "no_think_block": res["no_think"],
-        "original_trace_in_prompt":
-            None if res["no_think"] else res["raw"].strip() in res["p2_text"],
-        "compressed_trace_in_prompt":
-            None if res["no_think"] else res["short"].strip() in res["p2_text"],
+        "original_trace_in_prompt": res["orig_in_p2"],
+        "compressed_trace_in_prompt": res["comp_in_p2"],
         "compressor_truncated": res["cmeta"].get("truncated"),
         "error": res["cerr"],
         "ms": {"phase1": m1, "compress": mc, "phase2": m2},
@@ -571,13 +676,18 @@ async def chat(req: Request):
     stop = normalize_stop(body.get("stop"))
     pkey = prompt_key(body["messages"])
 
-    rendered = await post("/v1/chat/completions/render",
-                          {**body, "stream": False, "max_tokens": 1})
-    p_ids = rendered["token_ids"]
+    rk = render_key(body)
+    p_ids = S["render_cache"].get(rk)
+    if p_ids is None:
+        rendered = await post("/v1/chat/completions/render",
+                              {**body, "stream": False, "max_tokens": 1})
+        p_ids = rendered["token_ids"]
+        if len(S["render_cache"]) < RENDER_CACHE_MAX:
+            S["render_cache"][rk] = p_ids
 
     # chat_template_kwargs={"enable_thinking": false} renders a *closed* empty
     # think block, so there is nothing to compress. Probe rather than assume.
-    opens = await prompt_opens_think(p_ids)
+    opens = prompt_opens_think(p_ids)
     # Compression arms must share a fixed budget or the comparison is invalid,
     # so ANSWER_BUDGET wins there. When the prompt opens no think block the
     # caller's max_tokens has to be honoured for the response to match vLLM.
@@ -660,7 +770,7 @@ async def completions(req: Request):
     async def one(idx, p):
         p_ids = await tokenize_prompt(p)
         pkey = prompt_key(p if isinstance(p, str) else p_ids)
-        opens = await prompt_opens_think(p_ids)
+        opens = prompt_opens_think(p_ids)
         res = await cot_pipeline(p_ids, common=common, arm=arm, ratio=ratio,
                                  inject=inject, client_stop=stop,
                                  answer_budget=budget, prompt_opens=opens,
@@ -691,6 +801,15 @@ async def completions(req: Request):
                   "total_tokens": n_prompt + n_out},
         "cot_compression": [cot_meta(r, arm) for r in results],
     }
+
+
+@app.get("/sidecar/stats")
+async def stats():
+    """Upstream call counter, for verifying the per-request round-trip cost."""
+    return {"http_calls": S.get("http_calls", 0),
+            "render_cache": len(S.get("render_cache", {})),
+            "prefix_ok": S.get("prefix_ok"),
+            "log_queue": LOG_Q.qsize()}
 
 
 # Registered last so the specific route above wins. Harnesses need /v1/models
