@@ -317,6 +317,19 @@ async def compress_llm_ids(raw_ids: list[int], target: int, meta: dict,
     # Headroom matters: a compressor cut off at max_tokens is a truncated
     # compression, which silently turns this arm into the truncate arm.
     cap = max(128, int(target * 3))
+    # Clamp to the room the window actually has left. Without this, a long trace
+    # makes prompt+max_tokens exceed the context and vLLM rejects the REQUEST --
+    # zero tokens are generated, so there is nothing partial to salvage and the
+    # caller falls back to the FULL uncompressed trace, leaving that row not
+    # compressed at all. Clamping turns that hard failure into an ordinary
+    # finish_reason="length", whose partial compression IS carried into GEN 3.
+    room = MAX_MODEL_LEN - len(pc) - CTX_SAFETY
+    meta["compressor_room"] = room
+    meta["compressor_cap_clamped"] = cap > room
+    if room < 128:
+        raise RuntimeError(
+            f"no room to compress: prompt={len(pc)} window={MAX_MODEL_LEN}")
+    cap = min(cap, room)
     out = await cpost("/inference/v1/generate", {
         "token_ids": pc,
         "sampling_params": {"temperature": 0.0, "max_tokens": cap},
