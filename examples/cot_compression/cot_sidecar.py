@@ -273,6 +273,54 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+if WIRE_LOG:
+    @app.middleware("http")
+    async def _wire_log(request: Request, call_next):
+        """Log every request/response pair. Bodies are summarised, not dumped:
+        a single response here can be 600k chars."""
+        req_body = await request.body()
+
+        async def _receive():           # body() is single-shot; hand it back
+            return {"type": "http.request", "body": req_body, "more_body": False}
+        request._receive = _receive
+
+        t0 = time.perf_counter()
+        resp = await call_next(request)
+        chunks = [c async for c in resp.body_iterator]
+        raw = b"".join(chunks)
+        rec = {"ts": time.time(), "path": request.url.path,
+               "method": request.method, "status": resp.status_code,
+               "req_bytes": len(req_body), "resp_bytes": len(raw),
+               "ms": round((time.perf_counter() - t0) * 1000)}
+        try:
+            rq = json.loads(req_body or b"{}")
+            rec["req"] = {"model": rq.get("model"),
+                          "max_tokens": rq.get("max_tokens"),
+                          "seed": rq.get("seed"),
+                          "n_messages": len(rq.get("messages") or []),
+                          "ctk": rq.get("chat_template_kwargs")}
+        except Exception:
+            rec["req"] = {"raw_head": (req_body[:WIRE_BODY_CHARS]).decode("utf8", "replace")}
+        try:
+            ro = json.loads(raw or b"{}")
+            ch = (ro.get("choices") or [{}])[0]
+            m = ch.get("message") or {}
+            rec["resp"] = {"finish": ch.get("finish_reason"),
+                           "content_chars": len(m.get("content") or ""),
+                           "reasoning_chars": len(m.get("reasoning_content") or ""),
+                           "usage": ro.get("usage"),
+                           "cot": ro.get("cot_compression")}
+        except Exception:
+            rec["resp"] = {"raw_head": raw[:WIRE_BODY_CHARS].decode("utf8", "replace")}
+        try:
+            with open(WIRE_LOG, "a") as fh:
+                fh.write(json.dumps(rec) + "\n")
+        except Exception:
+            pass
+        return Response(raw, resp.status_code,
+                        media_type=resp.headers.get("content-type"))
+
+
 # --------------------------- compression arms ---------------------------
 # Every arm is a token-IDs -> token-IDs function. The trace never round-trips
 # through text on the way to the compressor, so no tokenizer drift can be
