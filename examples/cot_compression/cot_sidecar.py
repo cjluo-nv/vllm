@@ -471,6 +471,33 @@ async def cot_pipeline(p_ids, *, common, arm, ratio, inject, client_stop,
             text = trim_at_stop(strip_specials(await detok(gen)),
                                 client_stop, include_stop)
             ms = round((time.perf_counter() - t0) * 1000)
+            if prompt_opens:
+                # The prompt DID open <think>, so an unclosed block is unfinished
+                # REASONING, not an answer. Mirror vLLM's reasoning parser, which
+                # puts an unclosed block in reasoning_content and leaves content
+                # empty. Measured on the uncompressed xhigh baseline: every
+                # 245760-token non-terminating generation came back with
+                # generation="" and reasoning_content=the whole trace, so the
+                # grader saw an empty answer and simply marked it wrong.
+                # Returning it as the answer instead ships ~200k tokens to the
+                # judge and trips ContextWindowExceededError, which is what killed
+                # HLE chain job 541864.
+                # answer_ids stays = gen so usage.completion_tokens still reports
+                # the tokens actually generated, as vLLM does.
+                # Unfinished reasoning goes to reasoning_content, matching what
+                # vLLM's --reasoning-parser does with an unclosed block. Size is
+                # bounded separately by RC_MAX_CHARS at the response boundary,
+                # so fidelity here does not depend on the grader's limits.
+                return {"no_think": True, "closed": False, "fr1": fr1,
+                        "reasoning_ids": gen, "raw": text, "short": text,
+                        "c_ids": [], "cmeta": {}, "cerr": "no_think_block",
+                        "answer": "", "answer_ids": gen, "fr2": fr1,
+                        "p2_tail": "", "orig_in_p2": None, "comp_in_p2": None,
+                        "roundtrip_ids": None,
+                        "n_prompt": len(p_ids), "target": 0, "ms": (0, 0, ms)}
+            # No <think> was ever opened: an ordinary completion, so the
+            # generation really is the whole answer. Byte-exact pass-through
+            # (test_completions.py) depends on this branch -- do not change it.
             return {"no_think": True, "closed": False, "fr1": fr1,
                     "reasoning_ids": [], "raw": "", "short": "", "c_ids": [],
                     "cmeta": {}, "cerr": "no_think_block", "answer": text,
@@ -747,7 +774,9 @@ async def chat(req: Request):
         "model": body.get("model", MODEL),
         "choices": [{"index": 0, "finish_reason": res["fr2"],
                      "message": {"role": "assistant", "content": res["answer"],
-                                 "reasoning_content": res["short"]}}],
+                                 "reasoning_content":
+                                     res["short"][:RC_MAX_CHARS]
+                                     if RC_MAX_CHARS else res["short"]}}],
         "usage": {"prompt_tokens": res["n_prompt"],
                   "completion_tokens": len(res["answer_ids"]),
                   "total_tokens": res["n_prompt"] + len(res["answer_ids"])},
