@@ -211,9 +211,38 @@ Environment variables, all optional except where noted:
 | `TRACE_LOG` | `traces.jsonl` | JSONL log (`.gz` supported) |
 | `TRACE_CACHE_GLOB` | unset | Reuse phase-1 traces from prior runs |
 | `USE_PRIORITY` | `0` | Send `priority: -1` on phase 2 (needs `--scheduling-policy priority`) |
+| `MAX_MODEL_LEN` | `262144` | Window used for the GEN 2 room calculation |
+| `CTX_SAFETY` | `256` | Slack held back from that calculation |
+| `RC_MAX_CHARS` | `0` | Ceiling on `reasoning_content` in the response; 0 = unlimited |
+| `WIRE_LOG` | unset | JSONL log of every inbound request/response pair |
+| `WIRE_BODY_CHARS` | `600` | Body excerpt kept when a wire body will not parse as JSON |
 
 `cot_arm` and `cot_ratio` may also be set per request in the JSON body, so one
 server can serve every arm.
+
+## When phase 1 never closes `</think>`
+
+If the prompt opened a think block and phase 1 exhausted `THINK_BUDGET` without
+emitting `</think>`, the generation is unfinished **reasoning**, not an answer.
+The sidecar mirrors what vLLM's `--reasoning-parser` does with an unclosed block:
+
+```
+message.content           = ""            <- grader sees an empty answer, marks it wrong
+message.reasoning_content = the trace     <- full text, still logged in TRACE_LOG
+usage.completion_tokens   = tokens actually generated
+```
+
+This matters because graders read `content`. Returning the trace there instead
+ships the whole thing to the judge -- on HLE that meant ~196k tokens against
+GPT-4o's 128k window and a dead eval. The reasoning interceptor cannot rescue
+this: it strips `<think>` tags inside `content` and never looks at
+`reasoning_content`, and the sidecar has already removed those tags.
+
+`compress.error` is set to `no_think_block` for these rows, so they can be
+segmented out at analysis time.
+
+The bare-completion case (no `<think>` in the prompt at all) is unchanged: there
+the generation really is the answer.
 
 ## Arms
 
