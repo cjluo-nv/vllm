@@ -35,6 +35,26 @@ ARM = os.environ.get("ARM", "self")  # identity | truncate | self
 RATIO = float(os.environ.get("RATIO", "0.3"))
 THINK_BUDGET = int(os.environ.get("THINK_BUDGET", "4096"))
 ANSWER_BUDGET = int(os.environ.get("ANSWER_BUDGET", "1024"))
+MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "262144"))
+CTX_SAFETY = int(os.environ.get("CTX_SAFETY", "256"))
+# Optional ceiling on reasoning_content in the RESPONSE. 0 = unlimited (default),
+# so the sidecar mirrors vLLM exactly.
+#
+# Measured: the uncompressed xhigh HLE baseline judged all 2158 samples with 905
+# rows carrying reasoning_content >128k chars (max 857667). So graders do NOT
+# read this field -- only `content` (nemo-skills `generation`) reaches the judge,
+# and the baseline's own max there was 16908 chars. The invariant that matters is
+# therefore bounding `content`, which the no_think_block branch does by returning
+# an empty answer, exactly as vLLM's reasoning parser does. This knob stays only
+# as an escape hatch for a grader that behaves differently.
+RC_MAX_CHARS = int(os.environ.get("RC_MAX_CHARS", "0"))
+# Raw wire log: one line per inbound HTTP request/response pair, covering EVERY
+# route including the catch-all passthrough. TRACE_LOG only records the cot
+# pipeline, so it cannot show whether a harness called us at all -- during the
+# HLE resumes it stayed 0 bytes and that was ambiguous between "never called"
+# and "called but not pipelined". This disambiguates.
+WIRE_LOG = os.environ.get("WIRE_LOG", "")
+WIRE_BODY_CHARS = int(os.environ.get("WIRE_BODY_CHARS", "600"))
 TRACE_LOG = os.environ.get("TRACE_LOG", "traces.jsonl")
 TRACE_CACHE_GLOB = os.environ.get("TRACE_CACHE_GLOB", "")
 USE_PRIORITY = os.environ.get("USE_PRIORITY", "0") == "1"
