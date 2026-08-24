@@ -78,7 +78,11 @@ SUMMARY_HINT = (
 NOTES_HEAD = "Notes from my earlier work on this problem:\n\n"
 
 S: dict = {"render_cache": {}, "http_calls": 0, "requests": 0}
-up = httpx.AsyncClient(base_url=VLLM, timeout=httpx.Timeout(None))
+MAX_CONNS = int(os.environ.get("MAX_CONNS", "512"))
+up = httpx.AsyncClient(
+    base_url=VLLM, timeout=httpx.Timeout(None),
+    limits=httpx.Limits(max_connections=MAX_CONNS,
+                        max_keepalive_connections=MAX_CONNS // 2))
 
 
 # ------------------------------ plumbing ------------------------------
@@ -379,6 +383,10 @@ app = FastAPI(lifespan=lifespan)
 @app.post("/v1/chat/completions")
 async def chat(req: Request):
     body = await req.json()
+    if int(body.get("n") or 1) > 1:
+        return JSONResponse(
+            {"error": {"message": "n>1 unsupported by the online sidecar; "
+                                  "send repeats as separate requests"}}, 400)
     for k in ("logprobs", "top_logprobs"):
         if body.get(k):
             return JSONResponse(
