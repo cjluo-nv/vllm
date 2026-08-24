@@ -57,9 +57,14 @@ head_2 = P + <think> + "Notes...[1] S_0 [2] S_1" + CONTINUE_HINT
 ...
 ```
 
-`R_0 .. R_(n-1)` are discarded once summarized. `R_n` is kept **verbatim** and goes
-to the answer phase on both exit paths — it holds the conclusion, and compressing it
-is the one guaranteed-harmful compression available.
+`R_0 .. R_(n-1)` are discarded once summarized. `R_n` is kept **verbatim** — it holds
+the conclusion, and compressing it is the one guaranteed-harmful compression available.
+
+There are exactly two exits, and **neither manufactures an answer** (see
+"Out-of-budget behaviour"):
+
+- model emits `</think>` — answer generated from state + `R_n` verbatim
+- budget exhausted — return what stock vLLM returns for an unclosed block
 
 Peak context is `|P| + |state| + 4096`, independent of total thinking.
 
@@ -81,7 +86,7 @@ async def run(q_ids):
 
         if R.stop_reason == THINK_END_ID:              # done reasoning
             ans = await generate(head + R.ids + [THINK_END_ID],
-                                 max_tokens=ANSWER_BUDGET, temperature=1.0)
+                                 max_tokens=answer_room(gen), temperature=1.0)
             return finish(state, R.ids, ans, gen, closed=True)
 
         S = await generate(head + R.ids + SUMM_IDS,    # still inside <think>
@@ -90,10 +95,11 @@ async def run(q_ids):
         gen.summary += len(S.ids)
         state.append(sanitize(S.ids))
 
-    ans = await generate(q_ids + THINK_OPEN + state_ids(state)
-                         + R.ids + [THINK_END_ID],     # final chunk verbatim
-                         max_tokens=ANSWER_BUDGET, temperature=1.0)
-    return finish(state, R.ids, ans, gen, closed=False)
+    # Budget exhausted, or the guard fired before any chunk ran (R is None).
+    # Do NOT inject </think> and answer: stock vLLM returns an unclosed block
+    # with empty content, and manufacturing an answer here would score points
+    # the baseline did not get. See "Out-of-budget behaviour".
+    return unclosed(state, R, gen)
 ```
 
 Four deliberate choices:
@@ -107,8 +113,9 @@ Four deliberate choices:
 2. **`SUMMARY_HINT` does not close `</think>`.** Closing it first would make the model
    write a user-facing response, which is a different distribution: reader-oriented
    summary prose instead of a note-to-self.
-3. **No separate answer phase on the happy path.** `</think>` means done; one
-   follow-up call finishes. The forced path exists only for budget exhaustion.
+3. **No answer is generated on the budget-exhausted path.** `</think>` means done and
+   one follow-up call finishes; running out of budget returns an unclosed block, as
+   vLLM does.
 4. **`stop_token_ids` rather than generate-then-truncate** — no paying for discarded
    tokens, and `stop_reason` distinguishes "done thinking" from "chunk full".
 
@@ -120,13 +127,10 @@ These are the design. Everything else is plumbing.
 CONTINUE_HINT = "\n\nPicking up where I left off:\n"
 
 SUMMARY_HINT = (
-    "\n\nThis is getting long and I'm running out of space, so I'm going to "
-    "stop here — mid-thought, wherever this happens to land — and write "
-    "down what I need to pick up from. I'll put it plainly, in a few "
-    "sentences: the facts and exact numerical values I've established, what I "
-    "was in the middle of working out and how far I'd got, what I've ruled out "
-    "and why, and what's still open. I won't repeat notes I already wrote "
-    "above — only what's new or changed in this stretch.\n\n"
+    "\n\nI'm out of space, so I'll stop mid-thought here and note what I need "
+    "to resume: exact values I've established, what I was partway through, "
+    "what I've ruled out, and what's still open. Only what's new since my "
+    "last note.\n\n"
 )
 
 def render_state(blocks):
@@ -138,12 +142,16 @@ Each clause of `SUMMARY_HINT` targets a specific measured failure:
 
 | clause | failure it targets |
 |---|---|
-| "mid-thought, wherever this happens to land" | model summarizing as if a truncated line of reasoning had concluded, then never returning to it |
-| "exact numerical values" | LightThinker's documented numeric-loss bug — *"not sufficiently sensitive to numerical values"*, and *"such errors occur frequently"* |
-| "what I was in the middle of working out and how far I'd got" | losing the in-flight step at the cut |
-| "what I've ruled out and why" | re-exploration, which silently eats the savings |
+| "stop mid-thought here" | model summarizing as if a truncated line of reasoning had concluded, then never returning to it |
+| "exact values I've established" | LightThinker's documented numeric-loss bug — *"not sufficiently sensitive to numerical values"*, and *"such errors occur frequently"* |
+| "what I was partway through" | losing the in-flight step at the cut |
+| "what I've ruled out" | re-exploration, which silently eats the savings |
 | "what's still open" | the resumption target |
-| "won't repeat notes I already wrote above" | state bloat — the model can see its prior notes and will otherwise restate them |
+| "only what's new since my last note" | state bloat — the model can see its prior notes and will otherwise restate them |
+
+Halved from the first draft (~90 words to ~44) per review. It is re-tokenized into
+every summary call, and a long instruction at the seam both costs attention and biases
+the model toward list-shaped output rather than a natural note.
 
 The output is deliberately **free-form prose**, not a schema. Named fields would make
 the items separately inspectable, but JSON or headed sections inside a reasoning trace
@@ -157,20 +165,28 @@ Budget is matched to the **no-sidecar baseline**, which used `MAX_NEW = 245760`
 covering reasoning and answer in one stream:
 
 ```
-237,568  R blocks   = 58 x 4096   (exact)
-  8,192  answer
----------
-245,760  total task budget == baseline
+245,760  R blocks = 60 x 4096   (exact)   <- reasoning may use the whole pool
 ```
+
+`max_tokens` in the baseline is a **single pool** shared by reasoning and answer, so
+the arm mirrors that rather than pre-splitting it:
+
+```python
+def answer_room(gen):        # what baseline would have left for the answer
+    return min(ANSWER_BUDGET, 245_760 - gen.thinking)
+```
+
+Reasoning can therefore consume the entire 245,760 — exactly as baseline can — and
+when it does, there is nothing left for an answer and nothing is generated.
 
 | knob | value | rationale |
 |---|---|---|
 | `C_GEN` | 4096 | small chunks are safe because accumulation means no compounding; also keeps per-step compression at ~14x, where the compressor's habitual ~300-token output is a natural length |
-| `THINK_TOTAL` | 237,568 | R blocks only |
-| `MAX_CHUNKS` | 58 | exact |
+| `THINK_TOTAL` | 245,760 | R blocks only; == baseline `MAX_NEW` |
+| `MAX_CHUNKS` | 60 | exact |
 | `SUMM_CAP` | 512 | compressor writes ~300 regardless |
 | `T_SUMM` | 0.3 | state serialization wants fidelity, not diversity; reasoning stays at 1.0. **Unmeasured — my call, flagged for review.** |
-| `ANSWER_BUDGET` | 8192 | unchanged from `cot_sidecar.py` |
+| `ANSWER_BUDGET` | 8192 | ceiling only; actual room is `245760 - thinking` |
 | `MAX_MODEL_LEN` / `CTX_SAFETY` | 262144 / 256 | reused |
 | `request_timeout` (NEL) | **7200** | must change, see Cost |
 
@@ -179,11 +195,11 @@ covering reasoning and answer in one stream:
 them would handicap the arm against the baseline it is compared to. They still appear
 in `completion_tokens` for verbosity, tracked on a separate line.
 
-Worst-case state: 58 x 512 = 29,696. Peak context ~35K against a 262K window.
+Worst-case state: 60 x 512 = 30,720. Peak context ~36K against a 262K window.
 
 ## Cost
 
-Worst-case decode per request: 237,568 + ~17,400 summaries + 8,192 ~= **263K tokens**,
+Worst-case decode per request: 245,760 + ~18,000 summaries ~= **264K tokens**,
 versus the offline arm's ~205K. At the ~57 tok/s the offline run implies, that is
 ~4,600s against the current 3600s `request_timeout` — hence 7200.
 
@@ -223,6 +239,54 @@ both benefit most and set total run time.
 it are the accuracy question and the budget-matching. Throughput on the long tail is a
 bonus to report, not a claim to defend.
 
+## Out-of-budget behaviour
+
+**Requirement (review):** when reasoning runs out of budget, return exactly what the
+stock vLLM server returns. This is not cosmetic — it is a validity requirement.
+
+`cot_sidecar.py` already records the measured baseline behaviour:
+
+> *"vLLM ... puts an unclosed block in reasoning_content and leaves content empty.
+> Measured on the uncompressed xhigh baseline: every 245760-token non-terminating
+> generation came back with `generation=""` and `reasoning_content=`the whole trace,
+> so the grader saw an empty answer and simply marked it wrong."*
+
+So a baseline request that never closes `</think>` is **scored wrong**. If this arm
+instead injected `</think>` and generated an answer for those same requests, it would
+collect points the baseline never had a chance at — a confound in the arm's favour,
+concentrated on exactly the hardest problems.
+
+The first draft of this design did that. It is removed.
+
+```python
+def unclosed(state, R, gen):
+    reasoning = state_text(state) + (detok(R.ids) if R else "")
+    return {"content": "",                  # grader sees an empty answer
+            "reasoning_content": reasoning, # unclosed block, as vLLM does
+            "finish_reason": "length",
+            "completion_tokens": gen.thinking + gen.summary}
+```
+
+Three properties, each matching vLLM or the offline arm:
+
+| property | value | why |
+|---|---|---|
+| `content` | `""` | vLLM leaves it empty; the grader marks it wrong, as for baseline |
+| `reasoning_content` | state + `R_n` | vLLM's reasoning parser puts the unclosed block here |
+| `finish_reason` | `"length"` | matches vLLM |
+| `completion_tokens` | tokens actually generated | vLLM reports real generation; `cot_sidecar.py` keeps `answer_ids = gen` for the same reason |
+
+Reusing `cot_sidecar.py`'s `no_think_block` return shape keeps both compressed arms
+byte-comparable at this boundary.
+
+`RC_MAX_CHARS` stays at 0 (unbounded) as in the offline arm — the baseline judged 905
+rows carrying >128K chars of `reasoning_content` without incident, so capping it is
+unnecessary and would diverge from what was measured.
+
+This also subsumes edge case **G2**: when the context guard fires before any chunk
+runs, `R` is `None`, `reasoning` is just the (empty) state, and the same return fires.
+No special case, no `None` deref.
+
 ## Arms
 
 **Compress arm only**, by decision. Consequence to record: a delta of any size is
@@ -252,14 +316,15 @@ summaries, so "verbosity" no longer means what it meant in the offline study.
 ## Edge cases
 
 Enumerated systematically. Honest status: this list found eight gaps in the first
-draft of the loop; the ones marked **must** are in scope for v1.
+draft of the loop; the ones marked **must** are in scope for v1. One (`R is None`) was
+since resolved by the out-of-budget rework, leaving four.
 
 ### Control flow
 
 | case | handling |
 |---|---|
 | `</think>` in chunk 0 | happy path; `head_0` is byte-identical to a baseline generation, so short problems run exactly as baseline |
-| `</think>` never emitted across 58 chunks | forced path; `think_closed=False` |
+| `</think>` never emitted across 60 chunks | `unclosed()`; `think_closed=False`; content empty, as vLLM |
 | `</think>` mid-summary | `stop_token_ids`; keep what preceded |
 | summary hits `SUMM_CAP` | used as-is, counted via `summary_truncated` |
 | **EOS instead of `</think>`** | **must** — branch on `stop_reason == THINK_END_ID`, not `finish_reason == "stop"`. `finish_reason` is `"stop"` for both, and treating EOS as a `</think>` would inject one and ask for an answer against a sequence the model considers finished |
@@ -269,8 +334,8 @@ draft of the loop; the ones marked **must** are in scope for v1.
 | case | handling |
 |---|---|
 | state growth (58 x 512 + P + 4096 ~= 35K) | guard; never fires at these sizes |
-| **large `P`, guard fires at `i=0`** | **must** — `R` is `None` and the forced path does `R.ids`. Needs an explicit no-chunks-generated path |
-| answer prompt exceeding the window | clamp `ANSWER_BUDGET` to remaining room, same as `compress_llm_ids` already does for the compressor cap |
+| large `P`, guard fires at `i=0` | **resolved by the design change** — `unclosed()` handles `R is None`; no separate path |
+| answer prompt exceeding the window | `answer_room()` clamps to the remaining pool; also clamp to window room, as `compress_llm_ids` already does for the compressor cap |
 
 ### Token and state integrity
 
