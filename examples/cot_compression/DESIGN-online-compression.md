@@ -239,6 +239,41 @@ both benefit most and set total run time.
 it are the accuracy question and the budget-matching. Throughput on the long tail is a
 bonus to report, not a claim to defend.
 
+### EOS inside the block is NOT out-of-budget
+
+Measured on the first real run (`fdc7b2c8356e1bb6`, killed): **5.8% of GPQA and
+22.1% of HLE requests** ended with the model emitting EOS while still inside
+`<think>`, at 2-16 chunks and 4K-64K thinking tokens -- nowhere near the 60-chunk
+budget. Every one of them carried a complete answer:
+
+```
+...Therefore, the number of carbon atoms in product 3 is 11.
+
+Answer: A<|im_end|>
+```
+
+Resumed mid-thought by `CONTINUE_HINT`, the model never gets a natural moment to
+emit `</think>`; it simply writes the answer inline and stops. The first
+implementation routed this through `unclosed()`, returning `content=""`, so every
+one of those answers scored zero.
+
+**The out-of-budget rule does not apply here.** It is validated against baseline
+requests that *ran out of tokens*, which the baseline scores wrong. A voluntary
+stop is a different event: the baseline never scores that wrong, because its
+voluntary stop always carries `</think>` and an answer. Closing the tag for it
+restores parity rather than breaking it.
+
+So the loop now branches three ways, not two:
+
+| event | detection | behaviour |
+|---|---|---|
+| finished, tag emitted | `</think>` in output | answer from state + `R_n` |
+| finished, no tag (EOS) | `finish_reason != "length"` | strip trailing specials, inject `</think>`, answer. Counted in `eos_in_think` |
+| out of budget | 60 chunks consumed | `unclosed()` -- empty content, as vLLM |
+
+`eos_in_think` is reported so the rate stays auditable: if it is high, the
+`CONTINUE_HINT` seam is the thing to ablate.
+
 ## Out-of-budget behaviour
 
 **Requirement (review):** when reasoning runs out of budget, return exactly what the
@@ -325,6 +360,7 @@ since resolved by the out-of-budget rework, leaving four.
 |---|---|
 | `</think>` in chunk 0 | happy path; `head_0` is byte-identical to a baseline generation, so short problems run exactly as baseline |
 | `</think>` never emitted across 60 chunks | `unclosed()`; `think_closed=False`; content empty, as vLLM |
+| **EOS inside `<think>`** | **the model finished** -- inject `</think>` and answer; see above. Was the first run's biggest defect |
 | `</think>` mid-summary | `stop_token_ids`; keep what preceded |
 | summary hits `SUMM_CAP` | used as-is, counted via `summary_truncated` |
 | **EOS instead of `</think>`** | **must** — branch on `stop_reason == THINK_END_ID`, not `finish_reason == "stop"`. `finish_reason` is `"stop"` for both, and treating EOS as a `</think>` would inject one and ask for an answer against a sequence the model considers finished |

@@ -147,14 +147,34 @@ def main():
     check(not SCRIPT, "no answer call was made")
 
     print("\n" + "=" * 74)
-    print("4. EOS mid-reasoning -> finish_reason preserved as 'stop'")
+    print("4. EOS inside <think> -> model FINISHED, close the tag and answer")
     print("=" * 74)
+    # Measured on run fdc7b2c8356e1bb6: 5.8% of GPQA and 22.1% of HLE requests
+    # ended this way at 2-16 chunks, every one carrying a complete answer that
+    # was being discarded. Distinct from out-of-budget (case 3), which must keep
+    # returning empty content.
     M.C_GEN, M.THINK_TOTAL = 4096, 245760
-    script((enc("died here"), "stop"))
+    script((enc("...so the answer is 42.") + [ord("\u0001")], "stop"),
+           (enc("Answer: 42"), "stop"))
+    M.S["special_ids"] = {1}
     reasoning, answer, fr, gen, closed = run(P)
-    check(fr == "stop", f"finish_reason={fr!r} not coerced to length")
-    check(answer == "" and closed is False, "no answer manufactured")
-    check(reasoning == "died here", "reasoning carried out")
+    check(closed is True, "treated as finished, not as out-of-budget")
+    check(answer == "Answer: 42", f"answer extracted (got {answer!r})")
+    check(gen.eos_in_think == 1, f"eos_in_think counted ({gen.eos_in_think})")
+    check(1 not in CALLS[1][0], "trailing special stripped before splicing")
+    check(CALLS[1][0][-1] == TE, "</think> injected before the answer call")
+    check("42" in reasoning, "reasoning carried out")
+
+    print("\n" + "=" * 74)
+    print("4b. out-of-budget is UNCHANGED by the 4 fix (no answer)")
+    print("=" * 74)
+    M.C_GEN, M.THINK_TOTAL = 10, 20
+    script((enc("A" * 10), "length"), (enc("n1"), "stop"),
+           (enc("B" * 10), "length"))
+    reasoning, answer, fr, gen, closed = run(P)
+    check(answer == "" and fr == "length" and closed is False,
+          "budget path still returns empty content with length")
+    check(gen.eos_in_think == 0, "not counted as eos_in_think")
 
     print("\n" + "=" * 74)
     print("5. empty note -> Delethink tail fallback, loop survives")

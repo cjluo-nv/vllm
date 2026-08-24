@@ -165,6 +165,14 @@ def sanitize_ids(ids: list[int]) -> list[int]:
     return [t for t in ids if t not in banned]
 
 
+def _strip_trailing_specials(ids: list[int], banned: set) -> list[int]:
+    """Drop a trailing <|im_end|>/EOS so it is not spliced mid-prompt."""
+    out = list(ids)
+    while out and out[-1] in banned:
+        out.pop()
+    return out
+
+
 def find_think_end(ids: list[int]) -> int | None:
     """Index of </think>, or None.
 
@@ -216,12 +224,14 @@ async def state_text(blocks: list[list[int]]) -> str:
 
 class Counters:
     __slots__ = ("thinking", "summary", "answer", "chunks", "peak_ctx",
-                 "summary_empty", "summary_truncated", "summary_fallbacks")
+                 "summary_empty", "summary_truncated", "summary_fallbacks",
+                 "eos_in_think")
 
     def __init__(self):
         self.thinking = self.summary = self.answer = self.chunks = 0
         self.peak_ctx = 0
         self.summary_empty = self.summary_truncated = self.summary_fallbacks = 0
+        self.eos_in_think = 0
 
     def as_dict(self, state_tokens: int) -> dict:
         return {"n_chunks": self.chunks, "thinking_tokens": self.thinking,
@@ -229,7 +239,8 @@ class Counters:
                 "state_tokens": state_tokens, "peak_context": self.peak_ctx,
                 "summary_empty": self.summary_empty,
                 "summary_truncated": self.summary_truncated,
-                "summary_fallbacks": self.summary_fallbacks}
+                "summary_fallbacks": self.summary_fallbacks,
+                "eos_in_think": self.eos_in_think}
 
 
 def answer_room(gen: Counters) -> int:
@@ -278,13 +289,27 @@ async def run_online(p_ids: list[int], *, sp: dict, think_open: list[int]):
         gen.chunks += 1
 
         if c["finish_reason"] != "length":
-            # EOS (or a caller stop) rather than </think>. finish_reason is
-            # "stop" for both, so branching on it alone would mistake this for
-            # a finished think block and answer against a dead sequence.
-            # Carry the real reason out: vLLM reports "stop" for an EOS that
-            # lands inside an unclosed block, not "length".
-            term_fr = c["finish_reason"]
-            break
+            # EOS without </think>. The model has FINISHED -- resumed mid-thought
+            # by CONTINUE_HINT, it never had a natural moment to emit the tag, so
+            # it just wrote its answer inline and stopped. Measured on the first
+            # run: 5.8% of GPQA and 22.1% of HLE requests ended this way, at 2-16
+            # chunks, every one carrying a complete answer.
+            #
+            # This is NOT the out-of-budget case. That one is validated against
+            # the baseline (11 HLE rows, all scored wrong) and must keep
+            # returning empty content. Here the model stopped voluntarily, which
+            # the baseline never scores wrong -- baseline's voluntary stop always
+            # carries </think> and an answer. Closing the tag for it restores
+            # parity rather than breaking it.
+            gen.eos_in_think += 1
+            R = _strip_trailing_specials(R, S["special_ids"])
+            a = await generate(head + R + S["think_end_ids"],
+                               max_tokens=answer_room(gen), sp=sp,
+                               stop_think=False)
+            gen.answer = len(a["token_ids"])
+            answer = strip_specials(await detok(a["token_ids"])).strip()
+            reasoning = await state_text(state) + await detok(R)
+            return reasoning, answer, a["finish_reason"], gen, True
 
         if gen.thinking >= THINK_TOTAL:
             break
@@ -361,6 +386,10 @@ async def lifespan(app: FastAPI):
     S["think_start"] = (await tok("<think>"))[-1]
     S["banned_ids"] = {S["think_start"], S["think_end"]}
     S["special_strs"] = ("<|im_end|>", "<|endoftext|>", "<|im_start|>")
+    sp_ids = set()
+    for t in S["special_strs"]:
+        sp_ids.update(await tok(t))
+    S["special_ids"] = sp_ids
 
     S["summ_ids"] = await tok(SUMMARY_HINT)
     S["cont_ids"] = await tok(CONTINUE_HINT)
