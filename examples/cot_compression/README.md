@@ -14,6 +14,11 @@ Both `/v1/chat/completions` and `/v1/completions` are intercepted; everything
 else is proxied to vLLM unchanged, so an eval harness can point at the sidecar
 without modification.
 
+> **Related, not yet implemented:** compressing *during* generation rather than
+> after it — checkpoint every N tokens and keep reasoning — is designed in
+> [`DESIGN-online-compression.md`](DESIGN-online-compression.md). That variant
+> is a separate module; this one is unchanged.
+
 ### /v1/completions
 
 Same pipeline over a raw prompt. Accepts a string, a token-ID list, or a batch of
