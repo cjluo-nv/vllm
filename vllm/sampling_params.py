@@ -272,6 +272,31 @@ class SamplingParams(
     """Token IDs that stop the generation when they are generated. The returned
     output will contain the stop tokens unless the stop tokens are special
     tokens."""
+    soft_stop: str | list[str] | None = None
+    """String(s) that stop the generation when they are generated, but only
+    once `soft_stop_min_tokens` output tokens have been generated.
+
+    Below that budget these strings are completely inert: the model is free to
+    emit them and generation continues. This makes it possible to cut a
+    response at a semantic boundary (e.g. a paragraph break) at or past a
+    token budget, without suppressing the token in the logits and without
+    delaying EOS / `stop` / `stop_token_ids`, which stay ungated.
+
+    The returned output will not contain the matched string unless
+    `include_stop_str_in_output` is set."""
+    soft_stop_token_ids: list[int] | None = None
+    """Token IDs that stop the generation when they are generated, but only
+    once `soft_stop_min_tokens` output tokens have been generated.
+
+    NOTE: unlike `stop_token_ids`, these are deliberately *not* added to
+    `all_stop_token_ids`. `all_stop_token_ids` is what the min-tokens logits
+    processor masks to -inf, and masking a soft stop token would defeat the
+    purpose: the model must stay free to emit it below the budget."""
+    soft_stop_min_tokens: int = 0
+    """Number of output tokens that must be generated before `soft_stop` and
+    `soft_stop_token_ids` become active. Same semantics as `min_tokens`, but
+    it gates *only* the soft conditions: `stop`, `stop_token_ids`, EOS and
+    `min_tokens` itself are entirely unaffected."""
     ignore_eos: bool = False
     """Whether to ignore the EOS token and continue generating
     tokens after the EOS token is generated."""
@@ -386,6 +411,9 @@ class SamplingParams(
         seed: int | None = None,
         stop: str | list[str] | None = None,
         stop_token_ids: list[int] | None = None,
+        soft_stop: str | list[str] | None = None,
+        soft_stop_token_ids: list[int] | None = None,
+        soft_stop_min_tokens: int = 0,
         bad_words: list[str] | None = None,
         thinking_token_budget: int | None = None,
         include_stop_str_in_output: bool = False,
@@ -449,6 +477,9 @@ class SamplingParams(
             seed=seed,
             stop=stop,
             stop_token_ids=stop_token_ids,
+            soft_stop=soft_stop,
+            soft_stop_token_ids=soft_stop_token_ids,
+            soft_stop_min_tokens=soft_stop_min_tokens,
             bad_words=bad_words,
             thinking_token_budget=thinking_token_budget,
             include_stop_str_in_output=include_stop_str_in_output,
@@ -500,6 +531,16 @@ class SamplingParams(
         else:
             self.stop_token_ids = list(dict.fromkeys(self.stop_token_ids))
 
+        if self.soft_stop is None:
+            self.soft_stop = []
+        elif isinstance(self.soft_stop, str):
+            self.soft_stop = [self.soft_stop]
+
+        if self.soft_stop_token_ids is None:
+            self.soft_stop_token_ids = []
+        else:
+            self.soft_stop_token_ids = list(dict.fromkeys(self.soft_stop_token_ids))
+
         if self.bad_words is None:
             self.bad_words = []
         else:
@@ -512,9 +553,11 @@ class SamplingParams(
             self.prompt_logprobs = 1
 
         # Number of characters to hold back for stop string evaluation
-        # until sequence is finished.
-        if self.stop and not self.include_stop_str_in_output:
-            self.output_text_buffer_length = max(len(s) for s in self.stop) - 1
+        # until sequence is finished. Soft stop strings are held back too:
+        # they can truncate the output text just like regular stop strings.
+        all_stop_strings = [*self.stop, *self.soft_stop]
+        if all_stop_strings and not self.include_stop_str_in_output:
+            self.output_text_buffer_length = max(len(s) for s in all_stop_strings) - 1
 
         self._verify_args()
 
@@ -525,7 +568,10 @@ class SamplingParams(
             self.min_p = 0.0
             self._verify_greedy_sampling()
 
-        # eos_token_id is added to this by the engine
+        # eos_token_id is added to this by the engine.
+        # NOTE: `soft_stop_token_ids` are intentionally excluded. This set is
+        # masked to -inf by the min-tokens logits processor, and soft stop
+        # tokens must remain sampleable below their budget.
         self._all_stop_token_ids.update(self.stop_token_ids)
 
         if self.skip_reading_prefix_cache is None:
@@ -639,6 +685,34 @@ class SamplingParams(
             raise VLLMValidationError(
                 "stop strings are only supported when detokenize is True. "
                 "Set detokenize=True to use stop."
+            )
+        assert isinstance(self.soft_stop_token_ids, list)
+        if not all(isinstance(st_id, int) for st_id in self.soft_stop_token_ids):
+            raise VLLMValidationError(
+                "soft_stop_token_ids must contain only integers, got "
+                f"{self.soft_stop_token_ids}."
+            )
+        assert isinstance(self.soft_stop, list)
+        if any(not stop_str for stop_str in self.soft_stop):
+            raise VLLMValidationError("soft_stop cannot contain an empty string.")
+        if self.soft_stop and not self.detokenize:
+            raise VLLMValidationError(
+                "soft_stop strings are only supported when detokenize is True. "
+                "Set detokenize=True to use soft_stop."
+            )
+        if self.soft_stop_min_tokens < 0:
+            raise VLLMValidationError(
+                "soft_stop_min_tokens must be greater than or equal to 0, got "
+                f"{self.soft_stop_min_tokens}.",
+                parameter="soft_stop_min_tokens",
+                value=self.soft_stop_min_tokens,
+            )
+        if self.max_tokens is not None and self.soft_stop_min_tokens > self.max_tokens:
+            raise VLLMValidationError(
+                "soft_stop_min_tokens must be less than or equal to "
+                f"max_tokens={self.max_tokens}, got {self.soft_stop_min_tokens}.",
+                parameter="soft_stop_min_tokens",
+                value=self.soft_stop_min_tokens,
             )
         assert isinstance(self.bad_words, list)
         if any(not bad_word for bad_word in self.bad_words):
@@ -1145,6 +1219,9 @@ class SamplingParams(
             f"seed={self.seed}, "
             f"stop={self.stop}, "
             f"stop_token_ids={self.stop_token_ids}, "
+            f"soft_stop={self.soft_stop}, "
+            f"soft_stop_token_ids={self.soft_stop_token_ids}, "
+            f"soft_stop_min_tokens={self.soft_stop_min_tokens}, "
             f"bad_words={self.bad_words}, "
             f"thinking_token_budget={self.thinking_token_budget}, "
             f"include_stop_str_in_output={self.include_stop_str_in_output}, "

@@ -77,6 +77,9 @@ class CompletionRequest(OpenAIBaseModel):
     repetition_penalty: float | None = None
     length_penalty: float = 1.0
     stop_token_ids: list[int] | None = []
+    soft_stop: str | list[str] | None = None
+    soft_stop_token_ids: list[int] | None = None
+    soft_stop_min_tokens: int = 0
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
     min_tokens: int = 0
@@ -378,6 +381,9 @@ class CompletionRequest(OpenAIBaseModel):
             seed=self.seed,
             stop=self.stop,
             stop_token_ids=stop_token_ids,
+            soft_stop=self.soft_stop,
+            soft_stop_token_ids=self.soft_stop_token_ids,
+            soft_stop_min_tokens=self.soft_stop_min_tokens,
             logprobs=None if self.logprob_token_ids else self.logprobs,
             ignore_eos=self.ignore_eos,
             max_tokens=max_tokens if not echo_without_generation else 1,

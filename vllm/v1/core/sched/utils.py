@@ -109,6 +109,22 @@ def check_stop(request: Request, max_model_len: int) -> bool:
         request.status = RequestStatus.FINISHED_STOPPED
         request.stop_reason = last_token_id
         return True
+
+    # Budget-gated ("soft") stop token ids: inert until more than
+    # `soft_stop_min_tokens` output tokens have been generated. These are
+    # deliberately absent from `all_stop_token_ids`, so unlike `min_tokens`
+    # this never masks them out of the logits -- the model stays free to emit
+    # them early, we simply do not terminate on them.
+    soft_stop_token_ids = sampling_params.soft_stop_token_ids
+    if (
+        soft_stop_token_ids
+        and last_token_id in soft_stop_token_ids
+        and request.num_output_tokens
+        > max(sampling_params.min_tokens, sampling_params.soft_stop_min_tokens)
+    ):
+        request.status = RequestStatus.FINISHED_STOPPED
+        request.stop_reason = last_token_id
+        return True
     if (
         request.num_tokens >= max_model_len
         or request.num_output_tokens >= request.max_tokens
