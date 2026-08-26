@@ -535,6 +535,7 @@ class AsyncLLM(EngineClient):
             or params.n > 1
             or params.output_kind == RequestOutputKind.FINAL_ONLY
             or params.stop
+            or params.soft_stop
         ):
             raise VLLMValidationError(
                 "Input streaming not currently supported "

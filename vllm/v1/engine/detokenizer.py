@@ -82,10 +82,24 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         self.min_tokens = params.min_tokens
         self.include_stop_str_in_output = params.include_stop_str_in_output
 
+        # Budget-gated ("soft") stop strings: inert until
+        # `soft_stop_min_tokens` output tokens have been generated.
+        if params.soft_stop is None:
+            self.soft_stop = []
+        elif isinstance(params.soft_stop, str):
+            self.soft_stop = [params.soft_stop]
+        else:
+            self.soft_stop = params.soft_stop
+        # `min_tokens` stays a hard floor for every stop condition, so the
+        # effective soft gate is the larger of the two budgets.
+        self.soft_stop_min_tokens = max(params.soft_stop_min_tokens, params.min_tokens)
+
         # Number of chars to hold back when stop strings are to be excluded
-        # from streamed output.
-        if self.stop and not self.include_stop_str_in_output:
-            self.stop_buffer_length = max(len(s) for s in self.stop) - 1
+        # from streamed output. Soft stop strings truncate the output text the
+        # same way regular ones do, so they must be held back too.
+        all_stop_strings = [*self.stop, *self.soft_stop]
+        if all_stop_strings and not self.include_stop_str_in_output:
+            self.stop_buffer_length = max(len(s) for s in all_stop_strings) - 1
         else:
             self.stop_buffer_length = 0
         self._last_output_text_offset: int = 0
@@ -115,12 +129,21 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
 
         # 1) Detokenize the new token ids incrementally.
         stop_check_offset = len(self.output_text)
+        soft_stop_check_offset = stop_check_offset
         for new_token_id in new_token_ids:
             self.token_ids.append(new_token_id)
             self.output_text += self.decode_next(new_token_id)
             # Support min_tokens, see https://github.com/vllm-project/vllm/pull/22014
             if self.min_tokens and self.num_output_tokens() <= self.min_tokens:
                 stop_check_offset = len(self.output_text)
+            # Same, scoped to the soft stop strings only: text emitted below
+            # the soft budget is never searched, so soft stop strings that
+            # occur early are ignored instead of terminating the request.
+            if (
+                self.soft_stop_min_tokens
+                and self.num_output_tokens() <= self.soft_stop_min_tokens
+            ):
+                soft_stop_check_offset = len(self.output_text)
 
         if skipped_stop_token_id is not None:
             # Cleanup after skipping detokenization.
@@ -133,6 +156,25 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
                 output_text=self.output_text,
                 new_char_count=len(self.output_text) - stop_check_offset,
                 stop=self.stop,
+                include_in_output=self.include_stop_str_in_output,
+            )
+            if stop is not None:
+                stop_string, truncate_to = stop
+                if truncate_to != -1:
+                    self.output_text = self.output_text[:truncate_to]
+
+        # 3) Evaluate budget-gated (soft) stop strings. Regular stop strings
+        # win when both match in the same step, so this only runs if nothing
+        # matched above (and `self.output_text` has not been truncated yet).
+        if (
+            stop_string is None
+            and self.soft_stop
+            and self.num_output_tokens() > self.soft_stop_min_tokens
+        ):
+            stop = check_stop_strings(
+                output_text=self.output_text,
+                new_char_count=len(self.output_text) - soft_stop_check_offset,
+                stop=self.soft_stop,
                 include_in_output=self.include_stop_str_in_output,
             )
             if stop is not None:
